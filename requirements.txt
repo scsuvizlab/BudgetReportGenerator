@@ -1,0 +1,65 @@
+# Budget Justification Automation Tool - Complete Requirements
+# Updated for LLM Integration
+
+# Core GUI Framework
+PyQt6>=6.4.0
+PyQt6-WebEngine>=6.4.0  # For HTML preview in documents
+
+# Document Processing
+python-docx>=0.8.11     # Word document handling
+openpyxl>=3.1.0         # Excel file processing
+pandas>=2.0.0           # Data analysis and CSV handling
+rapidfuzz>=3.0.0        # Fuzzy string matching for field detection
+
+# LLM Integration (NEW)
+openai>=1.0.0           # OpenAI API client
+tiktoken>=0.5.0         # Token counting for cost estimation
+keyring>=24.0.0         # Secure API key storage
+
+# Document Text Extraction
+PyPDF2>=3.0.0           # PDF text extraction (primary)
+pdfplumber>=0.7.0       # PDF text extraction (alternative)
+markdown>=3.4.0         # Markdown processing
+
+# Data Processing and Utilities
+requests>=2.28.0        # HTTP requests (used by some dependencies)
+typing-extensions>=4.0.0  # Enhanced type hints for older Python
+
+# Development and Testing (Optional)
+pytest>=7.0.0           # Unit testing framework
+mypy>=1.0.0             # Static type checking
+ruff>=0.1.0             # Python linting and formatting
+
+# Platform-specific notes for keyring:
+# Windows: Works out of the box with Windows Credential Manager
+# macOS: Uses Keychain, works out of the box
+# Linux: May require additional packages:
+#   - Ubuntu/Debian: python3-secretstorage
+#   - Some distributions: python3-keyring
+#   - Or run with --no-keyring flag to disable secure storage
+
+# Minimum Python Version: 3.11+
+
+# Installation commands:
+
+# Full installation with all features:
+# pip install -r requirements.txt
+
+# Minimal installation (without PDF support):
+# pip install PyQt6 python-docx openpyxl pandas rapidfuzz openai tiktoken keyring markdown
+
+# Without keyring (for Docker/server environments):
+# pip install PyQt6 python-docx openpyxl pandas rapidfuzz openai tiktoken markdown
+# Note: Set OPENAI_API_KEY environment variable instead
+
+# Development environment:
+# pip install -r requirements.txt
+# pip install pytest mypy ruff  # Additional dev tools
+
+# Docker/containerized environments:
+# - Set OPENAI_API_KEY environment variable instead of using keyring
+# - Consider using volume mounts for persistent configuration storage
+# - May need to install additional system packages for GUI display
+
+# Package versions are minimums - newer versions should work
+# Last updated: June 2025
