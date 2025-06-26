@@ -1,470 +1,681 @@
 """
-LLM Integration Manager
-
-Orchestrates all LLM components and integrates with the session state.
+Enhanced LLM Integration Manager - Orchestrates AI-powered analysis with grant-specific intelligence
+Improved prompts and context awareness for better field detection and cell resolution
 """
+
+import json
 import logging
-from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
+from dataclasses import dataclass, asdict
+from enum import Enum
 
-from llm_client import LLMClient
-from cost_guard import CostGuard
-from api_key_manager import APIKeyManager
-from field_detector import FieldDetector, FieldSuggestion
-from cell_resolver import CellResolver, CellResolution
-from template_document import TemplateDocument
-from budget_book import BudgetBook, BudgetCell
-
-logger = logging.getLogger(__name__)
-
+# Import enhanced components
+from enhanced_budget_book import EnhancedBudgetBook, CellData
+from enhanced_field_detector import EnhancedFieldDetector, DetectedField, FieldType
+from enhanced_cell_resolver import EnhancedCellResolver, ResolutionResult, CellMatch
 
 @dataclass
-class EnhancedMapping:
-    """Enhanced field mapping result combining heuristics and LLM."""
-    field_name: str
-    budget_cell: Optional[BudgetCell]
+class LLMAnalysisRequest:
+    """Request for LLM analysis"""
+    template_text: str
+    budget_summary: Dict[str, Any]
+    analysis_type: str  # 'field_detection', 'cell_resolution', 'improvement_suggestions'
+    context: Dict[str, Any]
+    max_tokens: int = 2000
+    temperature: float = 0.1
+
+@dataclass
+class LLMAnalysisResult:
+    """Result from LLM analysis"""
+    success: bool
+    analysis_type: str
+    result_data: Dict[str, Any]
     confidence: float
-    source: str  # 'heuristic', 'llm', 'hybrid', 'manual'
-    reasoning: str
-    llm_cost: float = 0.0
-    field_suggestion: Optional[FieldSuggestion] = None
-    cell_resolution: Optional[CellResolution] = None
+    cost_estimate: float
+    tokens_used: int
+    processing_time: float
+    suggestions: List[str]
+    errors: List[str] = None
 
+class AnalysisType(Enum):
+    """Types of LLM analysis"""
+    FIELD_DETECTION = "field_detection"
+    CELL_RESOLUTION = "cell_resolution"
+    MAPPING_VALIDATION = "mapping_validation"
+    IMPROVEMENT_SUGGESTIONS = "improvement_suggestions"
+    CONTEXT_ENHANCEMENT = "context_enhancement"
 
-class LLMIntegrationManager:
-    """
-    Manages all LLM integration functionality.
+class EnhancedLLMIntegrationManager:
+    """Enhanced LLM integration with grant-specific intelligence"""
     
-    Responsibilities:
-    - Initialize and coordinate LLM components
-    - Orchestrate enhanced field detection and resolution
-    - Manage costs and budget limits
-    - Provide unified interface for session state
-    """
-    
-    def __init__(self):
-        """Initialize LLM integration manager."""
-        self.api_key_manager = APIKeyManager()
-        self.cost_guard: Optional[CostGuard] = None
-        self.llm_client: Optional[LLMClient] = None
-        self.field_detector: Optional[FieldDetector] = None
-        self.cell_resolver: Optional[CellResolver] = None
+    def __init__(self, llm_client, cost_guard):
+        self.llm_client = llm_client
+        self.cost_guard = cost_guard
+        self.logger = logging.getLogger(__name__)
+        self.grant_context_prompts = self._initialize_grant_prompts()
         
-        self.field_suggestions: Dict[str, FieldSuggestion] = {}
-        self.enhanced_mappings: Dict[str, EnhancedMapping] = {}
-        self.is_initialized = False
-    
-    def initialize_with_api_key(self, 
-                              api_key: str, 
-                              budget_limit: float = 5.0,
-                              default_model: str = "gpt-4o-mini") -> bool:
-        """
-        Initialize all LLM components with API key.
-        
-        Args:
-            api_key: OpenAI API key
-            budget_limit: Cost limit in USD
-            default_model: Default LLM model to use
-            
-        Returns:
-            True if initialization successful
-        """
-        try:
-            # Store API key
-            if not self.api_key_manager.set_api_key(api_key):
-                logger.error("Failed to set API key")
-                return False
-            
-            # Initialize cost guard
-            self.cost_guard = CostGuard(budget_limit_usd=budget_limit)
-            
-            # Initialize LLM client
-            self.llm_client = LLMClient(api_key, default_model)
-            
-            # Validate API key
-            if not self.llm_client.validate_api_key():
-                logger.error("API key validation failed")
-                return False
-            
-            # Initialize specialized components
-            self.field_detector = FieldDetector(self.llm_client)
-            self.cell_resolver = CellResolver(self.llm_client)
-            
-            self.is_initialized = True
-            logger.info("LLM integration initialized successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"LLM initialization failed: {e}")
-            self.is_initialized = False
-            return False
-    
-    def analyze_template_fields(self, template: TemplateDocument) -> List[FieldSuggestion]:
-        """
-        Analyze template to detect fields needing budget values.
-        
-        Args:
-            template: Template document to analyze
-            
-        Returns:
-            List of field suggestions from LLM
-        """
-        if not self._check_initialization():
-            return []
-        
-        try:
-            # Check cost before proceeding
-            estimated_cost = 0.50  # Rough estimate for template analysis
-            if not self.cost_guard.check_affordability(estimated_cost):
-                logger.warning("Cannot afford template analysis - budget limit reached")
-                return []
-            
-            # Analyze template
-            suggestions = self.field_detector.analyze_template(template)
-            
-            # Record actual cost
-            actual_cost = self.field_detector.last_analysis_cost
-            self.cost_guard.record_cost(
-                cost_usd=actual_cost,
-                tokens=0,  # Tokens tracked in LLM client
-                model=self.llm_client.default_model,
-                operation="template_analysis"
-            )
-            
-            # Store suggestions
-            for suggestion in suggestions:
-                self.field_suggestions[suggestion.field_name] = suggestion
-            
-            logger.info(f"Template analysis complete: {len(suggestions)} suggestions, cost ${actual_cost:.4f}")
-            return suggestions
-            
-        except Exception as e:
-            logger.error(f"Template analysis failed: {e}")
-            return []
-    
-    def enhanced_field_matching(self, 
-                              template: TemplateDocument, 
-                              budget_book: BudgetBook,
-                              use_heuristics_first: bool = True) -> Dict[str, EnhancedMapping]:
-        """
-        Perform enhanced field matching using heuristics + LLM.
-        
-        Args:
-            template: Template document
-            budget_book: Budget spreadsheet data
-            use_heuristics_first: Whether to try heuristics before LLM
-            
-        Returns:
-            Dictionary of enhanced mappings
-        """
-        if not self._check_initialization():
-            return {}
-        
-        try:
-            mappings = {}
-            
-            # Analyze template if not done yet
-            if not self.field_suggestions:
-                self.analyze_template_fields(template)
-            
-            for placeholder in template.placeholders:
-                field_name = placeholder.text
-                logger.info(f"Processing field: {field_name}")
-                
-                mapping = self._process_single_field(
-                    field_name, 
-                    placeholder, 
-                    budget_book, 
-                    use_heuristics_first
-                )
-                
-                mappings[field_name] = mapping
-                self.enhanced_mappings[field_name] = mapping
-            
-            return mappings
-            
-        except Exception as e:
-            logger.error(f"Enhanced field matching failed: {e}")
-            return {}
-    
-    def improve_low_confidence_mappings(self, 
-                                      current_mappings: Dict[str, Any],
-                                      budget_book: BudgetBook,
-                                      confidence_threshold: float = 0.6) -> int:
-        """
-        Use LLM to improve mappings with low confidence.
-        
-        Args:
-            current_mappings: Current field mappings
-            budget_book: Budget data
-            confidence_threshold: Threshold for improvement
-            
-        Returns:
-            Number of mappings improved
-        """
-        if not self._check_initialization():
-            return 0
-        
-        improved_count = 0
-        
-        for field_name, mapping in current_mappings.items():
-            if (hasattr(mapping, 'confidence') and 
-                mapping.confidence < confidence_threshold and
-                not getattr(mapping, 'is_manually_set', False)):
-                
-                try:
-                    # Check cost
-                    estimated_cost = 0.20
-                    if not self.cost_guard.check_affordability(estimated_cost):
-                        logger.warning(f"Cannot afford to improve {field_name} - budget limit reached")
-                        continue
-                    
-                    current_cell = getattr(mapping, 'budget_cell', None)
-                    if current_cell:
-                        resolution = self.cell_resolver.improve_low_confidence_resolution(
-                            field_name, current_cell, budget_book, confidence_threshold
-                        )
-                        
-                        if resolution and resolution.success and resolution.confidence > mapping.confidence:
-                            # Update mapping with improved resolution
-                            enhanced_mapping = EnhancedMapping(
-                                field_name=field_name,
-                                budget_cell=self._find_cell_by_value(budget_book, resolution.resolved_value),
-                                confidence=resolution.confidence,
-                                source='llm_improvement',
-                                reasoning=f"LLM improved: {resolution.reasoning}",
-                                llm_cost=self.cell_resolver.resolution_cost,
-                                cell_resolution=resolution
-                            )
-                            
-                            self.enhanced_mappings[field_name] = enhanced_mapping
-                            improved_count += 1
-                            
-                            logger.info(f"Improved {field_name}: {mapping.confidence:.2f} → {resolution.confidence:.2f}")
-                
-                except Exception as e:
-                    logger.error(f"Failed to improve mapping for {field_name}: {e}")
-        
-        logger.info(f"LLM improved {improved_count} low-confidence mappings")
-        return improved_count
-    
-    def _process_single_field(self, 
-                            field_name: str, 
-                            placeholder: Any,
-                            budget_book: BudgetBook,
-                            use_heuristics_first: bool) -> EnhancedMapping:
-        """
-        Process a single field using best available method.
-        
-        Args:
-            field_name: Name of the field
-            placeholder: Template placeholder object
-            budget_book: Budget data
-            use_heuristics_first: Whether to try heuristics first
-            
-        Returns:
-            Enhanced mapping result
-        """
-        # Try heuristic matching first if requested
-        if use_heuristics_first:
-            heuristic_matches = budget_book.find_by_label(field_name)
-            
-            if heuristic_matches and heuristic_matches[0].confidence > 0.8:
-                # High confidence heuristic match
-                best_match = heuristic_matches[0]
-                return EnhancedMapping(
-                    field_name=field_name,
-                    budget_cell=best_match,
-                    confidence=best_match.confidence,
-                    source='heuristic',
-                    reasoning=f"High confidence heuristic match to '{best_match.label}'"
-                )
-        
-        # Use LLM resolution
-        try:
-            # Check cost
-            estimated_cost = 0.30
-            if not self.cost_guard.check_affordability(estimated_cost):
-                logger.warning(f"Cannot afford LLM resolution for {field_name}")
-                return self._create_failed_mapping(field_name, "Budget limit reached")
-            
-            # Get candidates for LLM analysis
-            candidates = budget_book.find_by_label(field_name)
-            if not candidates:
-                # Expand search if no direct matches
-                clean_field = field_name.replace('{', '').replace('}', '').replace('_', ' ')
-                candidates = budget_book.find_by_label(clean_field)
-            
-            if not candidates:
-                # Use top values as candidates
-                candidates = sorted(budget_book.cells, key=lambda x: x.value, reverse=True)[:15]
-            
-            # Get field suggestion
-            field_suggestion = self.field_suggestions.get(field_name)
-            
-            # Resolve with LLM
-            resolution = self.cell_resolver.resolve_field_to_cells(
-                field_name, field_suggestion, candidates, budget_book
-            )
-            
-            # Record cost
-            self.cost_guard.record_cost(
-                cost_usd=self.cell_resolver.resolution_cost,
-                tokens=0,
-                model=self.llm_client.default_model,
-                operation="field_resolution"
-            )
-            
-            if resolution.success:
-                # Find the actual budget cell
-                resolved_cell = self._find_cell_by_value(budget_book, resolution.resolved_value)
-                
-                return EnhancedMapping(
-                    field_name=field_name,
-                    budget_cell=resolved_cell,
-                    confidence=resolution.confidence,
-                    source='llm',
-                    reasoning=resolution.reasoning,
-                    llm_cost=self.cell_resolver.resolution_cost,
-                    field_suggestion=field_suggestion,
-                    cell_resolution=resolution
-                )
-            else:
-                return self._create_failed_mapping(field_name, resolution.reasoning)
-                
-        except Exception as e:
-            logger.error(f"LLM resolution failed for {field_name}: {e}")
-            return self._create_failed_mapping(field_name, f"LLM error: {str(e)}")
-    
-    def _find_cell_by_value(self, budget_book: BudgetBook, value: Optional[float]) -> Optional[BudgetCell]:
-        """
-        Find a budget cell with the specified value.
-        
-        Args:
-            budget_book: Budget data
-            value: Value to find
-            
-        Returns:
-            Matching cell if found
-        """
-        if value is None:
-            return None
-        
-        # Look for exact match first
-        for cell in budget_book.cells:
-            if abs(cell.value - value) < 0.01:  # Allow small rounding differences
-                return cell
-        
-        return None
-    
-    def _create_failed_mapping(self, field_name: str, reason: str) -> EnhancedMapping:
-        """
-        Create a failed mapping result.
-        
-        Args:
-            field_name: Name of the field
-            reason: Reason for failure
-            
-        Returns:
-            Failed mapping
-        """
-        return EnhancedMapping(
-            field_name=field_name,
-            budget_cell=None,
-            confidence=0.0,
-            source='failed',
-            reasoning=f"Failed: {reason}"
-        )
-    
-    def _check_initialization(self) -> bool:
-        """Check if LLM integration is properly initialized."""
-        if not self.is_initialized:
-            logger.warning("LLM integration not initialized")
-            return False
-        return True
-    
-    def get_usage_summary(self) -> Dict[str, Any]:
-        """
-        Get comprehensive usage summary.
-        
-        Returns:
-            Dictionary with all usage statistics
-        """
-        summary = {
-            'initialized': self.is_initialized,
-            'api_key_status': self.api_key_manager.get_key_status() if self.api_key_manager else {},
-            'total_cost': 0.0,
-            'budget_remaining': 0.0,
-            'enhanced_mappings': len(self.enhanced_mappings),
-            'field_suggestions': len(self.field_suggestions)
+    def _initialize_grant_prompts(self) -> Dict[str, str]:
+        """Initialize grant-specific prompts for different analysis types"""
+        return {
+            'field_detection': """
+You are an expert in grant proposal budget analysis. Analyze the following template text and identify ALL placeholders/fields, paying special attention to:
+
+1. PERSONNEL FIELDS: Names, titles, salaries, effort percentages, roles
+2. EXPENSE FIELDS: Equipment items, costs, categories, descriptions  
+3. DESCRIPTIVE FIELDS: Notes, justifications, descriptions, explanations
+4. TEMPORAL FIELDS: Years, dates, project periods
+5. QUANTITATIVE FIELDS: Quantities, rates, totals, percentages
+
+For each field found, determine:
+- Field type (personnel_name, personnel_title, personnel_salary, personnel_effort, expense_item, expense_amount, expense_category, description, notes, justification, year, date, quantity, rate, total)
+- Confidence level (0.0-1.0)
+- Context clues from surrounding text
+- Specific suggestions for what to look for in budget data
+
+IMPORTANT: Look for both explicit placeholders like {field_name} and implicit placeholders like [field] or __field__.
+
+Template text to analyze:
+{template_text}
+
+Respond with a JSON object containing an array of detected fields.
+""",
+
+            'cell_resolution': """
+You are an expert in matching grant budget template fields to spreadsheet data. Given the field information and budget cell data, identify the BEST matches by considering:
+
+1. SEMANTIC MATCHING: Field names vs cell values and context
+2. DATA TYPE COMPATIBILITY: Numeric fields need numeric cells, text fields need text cells
+3. CONTEXTUAL RELEVANCE: Surrounding labels, column headers, row context
+4. GRANT-SPECIFIC PATTERNS: Personnel sections, expense categories, notes columns
+5. PROXIMITY LOGIC: Related data usually appears near each other
+
+Field to match: {field_info}
+Available budget cells: {cell_data}
+
+For each potential match, provide:
+- Match confidence (0.0-1.0)
+- Specific reasons for the match
+- Data type compatibility assessment
+- Context relevance score
+
+Focus especially on:
+- Names and titles in personnel sections
+- Dollar amounts in cost columns  
+- Descriptions and notes (often in rightmost columns)
+- Effort percentages and FTE values
+- Equipment and supply lists
+
+Respond with JSON containing ranked match suggestions.
+""",
+
+            'mapping_validation': """
+You are validating field-to-cell mappings for a grant proposal budget. Review each mapping and assess:
+
+1. LOGICAL CONSISTENCY: Does the mapping make sense?
+2. DATA TYPE MATCH: Are numeric fields mapped to numbers, text to text?
+3. CONTEXTUAL APPROPRIATENESS: Does the cell context match the field purpose?
+4. COMPLETENESS: Are all important fields mapped?
+5. ACCURACY: Are the mappings precise and specific?
+
+Current mappings: {mappings}
+Template context: {template_context}
+Budget context: {budget_context}
+
+For each mapping, provide:
+- Validation confidence (0.0-1.0)
+- Issues or concerns
+- Improvement suggestions
+- Alternative mapping recommendations
+
+Pay special attention to:
+- Personnel names mapping to actual names
+- Salary fields mapping to dollar amounts
+- Effort percentages mapping to percentage values
+- Notes/descriptions mapping to text content
+- Equipment items mapping to item names
+
+Respond with JSON containing validation results and suggestions.
+""",
+
+            'improvement_suggestions': """
+You are providing recommendations to improve grant budget analysis. Based on the analysis results, suggest:
+
+1. TEMPLATE IMPROVEMENTS: Better field names, clearer placeholders
+2. BUDGET ORGANIZATION: How to structure budget data better
+3. MAPPING ENHANCEMENTS: Ways to improve field-to-cell matching
+4. PROCESS OPTIMIZATION: Steps to streamline the workflow
+5. QUALITY ASSURANCE: Methods to validate accuracy
+
+Analysis results: {analysis_results}
+Current issues: {issues}
+User context: {user_context}
+
+Provide specific, actionable suggestions including:
+- Field naming conventions for better recognition
+- Budget layout recommendations
+- Common patterns to watch for
+- Quality checks to perform
+- Best practices for grant proposals
+
+Respond with JSON containing categorized improvement suggestions.
+""",
+
+            'context_enhancement': """
+You are enhancing the contextual understanding of budget data for grant proposal analysis. Analyze the budget structure and identify:
+
+1. PERSONNEL SECTIONS: Groups of cells containing staff information
+2. EXPENSE CATEGORIES: Equipment, travel, supplies, etc.
+3. DESCRIPTIVE CONTENT: Notes, justifications, explanations
+4. TEMPORAL ELEMENTS: Years, project phases, timelines
+5. RELATIONSHIPS: How different data elements connect
+
+Budget data summary: {budget_summary}
+Detected patterns: {patterns}
+
+Identify and describe:
+- Personnel groupings and their components
+- Expense category structures
+- Notes and description locations
+- Temporal organization patterns
+- Cross-references and relationships
+
+This will help improve automatic field detection and matching.
+
+Respond with JSON containing enhanced context information.
+"""
         }
+    
+    async def analyze_template_fields(self, template_text: str, 
+                                    additional_context: Dict[str, Any] = None) -> LLMAnalysisResult:
+        """Analyze template text to detect fields using LLM"""
+        try:
+            # Prepare prompt
+            prompt = self.grant_context_prompts['field_detection'].format(
+                template_text=template_text
+            )
+            
+            # Add additional context if provided
+            if additional_context:
+                prompt += f"\n\nAdditional context: {json.dumps(additional_context, indent=2)}"
+            
+            # Make LLM request
+            request = LLMAnalysisRequest(
+                template_text=template_text,
+                budget_summary={},
+                analysis_type=AnalysisType.FIELD_DETECTION.value,
+                context=additional_context or {},
+                max_tokens=2000,
+                temperature=0.1
+            )
+            
+            result = await self._make_llm_request(request, prompt)
+            
+            # Parse and validate results
+            if result.success:
+                result.result_data = self._validate_field_detection_result(result.result_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in template field analysis: {str(e)}")
+            return LLMAnalysisResult(
+                success=False,
+                analysis_type=AnalysisType.FIELD_DETECTION.value,
+                result_data={},
+                confidence=0.0,
+                cost_estimate=0.0,
+                tokens_used=0,
+                processing_time=0.0,
+                suggestions=[],
+                errors=[str(e)]
+            )
+    
+    async def resolve_field_mappings(self, detected_fields: List[DetectedField], 
+                                   budget_cells: List[CellData],
+                                   batch_size: int = 5) -> LLMAnalysisResult:
+        """Resolve field mappings using LLM in batches"""
+        try:
+            all_mappings = []
+            total_cost = 0.0
+            total_tokens = 0
+            
+            # Process fields in batches to manage cost and token limits
+            for i in range(0, len(detected_fields), batch_size):
+                batch_fields = detected_fields[i:i + batch_size]
+                
+                # Prepare field and cell data for LLM
+                field_data = self._prepare_field_data_for_llm(batch_fields)
+                cell_data = self._prepare_cell_data_for_llm(budget_cells)
+                
+                # Create prompt for this batch
+                prompt = self.grant_context_prompts['cell_resolution'].format(
+                    field_info=json.dumps(field_data, indent=2),
+                    cell_data=json.dumps(cell_data, indent=2)
+                )
+                
+                request = LLMAnalysisRequest(
+                    template_text="",
+                    budget_summary={'cells_count': len(budget_cells)},
+                    analysis_type=AnalysisType.CELL_RESOLUTION.value,
+                    context={'batch': i // batch_size + 1, 'total_batches': (len(detected_fields) + batch_size - 1) // batch_size},
+                    max_tokens=3000,
+                    temperature=0.1
+                )
+                
+                batch_result = await self._make_llm_request(request, prompt)
+                
+                if batch_result.success:
+                    batch_mappings = self._validate_cell_resolution_result(batch_result.result_data)
+                    all_mappings.extend(batch_mappings)
+                    total_cost += batch_result.cost_estimate
+                    total_tokens += batch_result.tokens_used
+                else:
+                    self.logger.warning(f"Batch {i // batch_size + 1} failed: {batch_result.errors}")
+            
+            return LLMAnalysisResult(
+                success=len(all_mappings) > 0,
+                analysis_type=AnalysisType.CELL_RESOLUTION.value,
+                result_data={'mappings': all_mappings},
+                confidence=sum(m.get('confidence', 0) for m in all_mappings) / len(all_mappings) if all_mappings else 0,
+                cost_estimate=total_cost,
+                tokens_used=total_tokens,
+                processing_time=0.0,  # Would need to track actual time
+                suggestions=self._generate_mapping_suggestions(all_mappings)
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error in field mapping resolution: {str(e)}")
+            return LLMAnalysisResult(
+                success=False,
+                analysis_type=AnalysisType.CELL_RESOLUTION.value,
+                result_data={},
+                confidence=0.0,
+                cost_estimate=0.0,
+                tokens_used=0,
+                processing_time=0.0,
+                suggestions=[],
+                errors=[str(e)]
+            )
+    
+    async def validate_mappings(self, resolution_results: List[ResolutionResult],
+                              template_context: str, budget_context: Dict[str, Any]) -> LLMAnalysisResult:
+        """Validate field-to-cell mappings using LLM"""
+        try:
+            # Prepare mapping data for validation
+            mappings_data = self._prepare_mappings_for_validation(resolution_results)
+            
+            prompt = self.grant_context_prompts['mapping_validation'].format(
+                mappings=json.dumps(mappings_data, indent=2),
+                template_context=template_context,
+                budget_context=json.dumps(budget_context, indent=2)
+            )
+            
+            request = LLMAnalysisRequest(
+                template_text=template_context,
+                budget_summary=budget_context,
+                analysis_type=AnalysisType.MAPPING_VALIDATION.value,
+                context={'mappings_count': len(resolution_results)},
+                max_tokens=2500,
+                temperature=0.1
+            )
+            
+            result = await self._make_llm_request(request, prompt)
+            
+            if result.success:
+                result.result_data = self._validate_mapping_validation_result(result.result_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in mapping validation: {str(e)}")
+            return LLMAnalysisResult(
+                success=False,
+                analysis_type=AnalysisType.MAPPING_VALIDATION.value,
+                result_data={},
+                confidence=0.0,
+                cost_estimate=0.0,
+                tokens_used=0,
+                processing_time=0.0,
+                suggestions=[],
+                errors=[str(e)]
+            )
+    
+    async def suggest_improvements(self, analysis_results: Dict[str, Any],
+                                 issues: List[str], user_context: Dict[str, Any]) -> LLMAnalysisResult:
+        """Generate improvement suggestions using LLM"""
+        try:
+            prompt = self.grant_context_prompts['improvement_suggestions'].format(
+                analysis_results=json.dumps(analysis_results, indent=2),
+                issues=json.dumps(issues),
+                user_context=json.dumps(user_context, indent=2)
+            )
+            
+            request = LLMAnalysisRequest(
+                template_text="",
+                budget_summary=user_context,
+                analysis_type=AnalysisType.IMPROVEMENT_SUGGESTIONS.value,
+                context={'issues_count': len(issues)},
+                max_tokens=2000,
+                temperature=0.2  # Slightly higher for creative suggestions
+            )
+            
+            result = await self._make_llm_request(request, prompt)
+            
+            if result.success:
+                result.result_data = self._validate_improvement_suggestions_result(result.result_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error generating improvement suggestions: {str(e)}")
+            return LLMAnalysisResult(
+                success=False,
+                analysis_type=AnalysisType.IMPROVEMENT_SUGGESTIONS.value,
+                result_data={},
+                confidence=0.0,
+                cost_estimate=0.0,
+                tokens_used=0,
+                processing_time=0.0,
+                suggestions=[],
+                errors=[str(e)]
+            )
+    
+    async def enhance_context_understanding(self, budget_book: EnhancedBudgetBook) -> LLMAnalysisResult:
+        """Enhance understanding of budget structure and context using LLM"""
+        try:
+            # Prepare budget summary for analysis
+            budget_summary = self._prepare_budget_summary_for_llm(budget_book)
+            patterns = self._extract_patterns_from_budget(budget_book)
+            
+            prompt = self.grant_context_prompts['context_enhancement'].format(
+                budget_summary=json.dumps(budget_summary, indent=2),
+                patterns=json.dumps(patterns, indent=2)
+            )
+            
+            request = LLMAnalysisRequest(
+                template_text="",
+                budget_summary=budget_summary,
+                analysis_type=AnalysisType.CONTEXT_ENHANCEMENT.value,
+                context={'sheets_count': len(budget_book.sheets_data)},
+                max_tokens=2500,
+                temperature=0.1
+            )
+            
+            result = await self._make_llm_request(request, prompt)
+            
+            if result.success:
+                result.result_data = self._validate_context_enhancement_result(result.result_data)
+            
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"Error in context enhancement: {str(e)}")
+            return LLMAnalysisResult(
+                success=False,
+                analysis_type=AnalysisType.CONTEXT_ENHANCEMENT.value,  
+                result_data={},
+                confidence=0.0,
+                cost_estimate=0.0,
+                tokens_used=0,
+                processing_time=0.0,
+                suggestions=[],
+                errors=[str(e)]
+            )
+    
+    async def _make_llm_request(self, request: LLMAnalysisRequest, prompt: str) -> LLMAnalysisResult:
+        """Make LLM request with cost tracking and error handling"""
+        try:
+            import time
+            start_time = time.time()
+            
+            # Check cost limits
+            if not self.cost_guard.check_request_budget(estimated_tokens=request.max_tokens):
+                raise Exception("Cost limit exceeded")
+            
+            # Make the actual LLM call
+            response = await self.llm_client.complete(
+                prompt=prompt,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature
+            )
+            
+            processing_time = time.time() - start_time
+            
+            # Parse JSON response
+            try:
+                result_data = json.loads(response.content)
+            except json.JSONDecodeError:
+                # Try to extract JSON from response if it's wrapped in other text
+                import re
+                json_match = re.search(r'\{.*\}', response.content, re.DOTALL)
+                if json_match:
+                    result_data = json.loads(json_match.group())
+                else:
+                    raise Exception("Could not parse JSON response from LLM")
+            
+            # Track costs
+            cost_estimate = self.cost_guard.estimate_cost(response.usage.total_tokens)
+            self.cost_guard.track_usage(response.usage.total_tokens, cost_estimate)
+            
+            return LLMAnalysisResult(
+                success=True,
+                analysis_type=request.analysis_type,
+                result_data=result_data,
+                confidence=0.8,  # Default confidence, can be adjusted based on response quality
+                cost_estimate=cost_estimate,
+                tokens_used=response.usage.total_tokens,
+                processing_time=processing_time,
+                suggestions=result_data.get('suggestions', [])
+            )
+            
+        except Exception as e:
+            self.logger.error(f"LLM request failed: {str(e)}")
+            return LLMAnalysisResult(
+                success=False,
+                analysis_type=request.analysis_type,
+                result_data={},
+                confidence=0.0,
+                cost_estimate=0.0,
+                tokens_used=0,
+                processing_time=0.0,
+                suggestions=[],
+                errors=[str(e)]
+            )
+    
+    def _prepare_field_data_for_llm(self, fields: List[DetectedField]) -> List[Dict[str, Any]]:
+        """Prepare field data for LLM analysis"""
+        field_data = []
+        for field in fields:
+            field_dict = {
+                'placeholder': field.placeholder,
+                'original_text': field.original_text,
+                'field_type': field.field_type.value,
+                'confidence': field.confidence,
+                'context_before': field.context_before[:100],  # Limit context length
+                'context_after': field.context_after[:100],
+                'grant_specific': field.grant_specific,
+                'suggested_mappings': field.suggested_mappings[:3]  # Top 3 suggestions
+            }
+            field_data.append(field_dict)
+        return field_data
+    
+    def _prepare_cell_data_for_llm(self, cells: List[CellData], max_cells: int = 50) -> List[Dict[str, Any]]:
+        """Prepare cell data for LLM analysis (limit size to manage tokens)"""
+        # Sort cells by confidence and take top cells
+        sorted_cells = sorted(cells, key=lambda x: x.confidence, reverse=True)[:max_cells]
         
-        if self.cost_guard:
-            cost_breakdown = self.cost_guard.get_cost_breakdown()
-            summary.update({
-                'total_cost': cost_breakdown['total_cost'],
-                'budget_remaining': cost_breakdown['budget_remaining'],
-                'budget_utilization': cost_breakdown['budget_utilization'],
-                'total_operations': cost_breakdown['total_operations']
-            })
+        cell_data = []
+        for cell in sorted_cells:
+            cell_dict = {
+                'value': str(cell.value)[:100] if cell.value else "",  # Limit length
+                'row': cell.row,
+                'col': cell.col,
+                'column_name': cell.column_name,
+                'data_type': cell.data_type,
+                'confidence': cell.confidence,
+                'context_labels': cell.context_labels[:3],  # Top 3 context labels
+                'notes': cell.notes[:100] if cell.notes else ""  # Limit notes length
+            }
+            cell_data.append(cell_dict)
+        return cell_data
+    
+    def _prepare_mappings_for_validation(self, results: List[ResolutionResult]) -> List[Dict[str, Any]]:
+        """Prepare mapping data for validation"""
+        mappings_data = []
+        for result in results:
+            mapping_dict = {
+                'field_placeholder': result.field.placeholder,
+                'field_type': result.field.field_type.value,
+                'field_confidence': result.field.confidence,
+                'resolution_confidence': result.resolution_confidence,
+                'needs_manual_review': result.needs_manual_review
+            }
+            
+            if result.primary_match:
+                mapping_dict['matched_cell'] = {
+                    'value': str(result.primary_match.cell.value),
+                    'data_type': result.primary_match.cell.data_type,
+                    'context_labels': result.primary_match.cell.context_labels,
+                    'match_reasons': result.primary_match.match_reasons
+                }
+            else:
+                mapping_dict['matched_cell'] = None
+            
+            mappings_data.append(mapping_dict)
+        return mappings_data
+    
+    def _prepare_budget_summary_for_llm(self, budget_book: EnhancedBudgetBook) -> Dict[str, Any]:
+        """Prepare budget summary for LLM analysis"""
+        summary = budget_book._generate_summary()
         
-        if self.llm_client:
-            llm_stats = self.llm_client.get_usage_stats()
-            summary.update({
-                'llm_tokens': llm_stats['total_tokens'],
-                'llm_calls': llm_stats['call_count']
-            })
+        # Add structure information
+        summary['sheets'] = {}
+        for sheet_name, sheet_data in budget_book.sheets_data.items():
+            summary['sheets'][sheet_name] = {
+                'max_row': sheet_data['max_row'],
+                'max_col': sheet_data['max_col'],
+                'notes_column': sheet_data.get('notes_column'),
+                'personnel_entries_count': len(sheet_data.get('personnel_entries', [])),
+                'expense_entries_count': len(sheet_data.get('expense_categories', [])),
+                'contextual_groups_count': len(sheet_data.get('contextual_groups', []))
+            }
         
         return summary
     
-    def reset_session(self) -> None:
-        """Reset session data but keep initialization."""
-        self.field_suggestions.clear()
-        self.enhanced_mappings.clear()
+    def _extract_patterns_from_budget(self, budget_book: EnhancedBudgetBook) -> Dict[str, Any]:
+        """Extract patterns from budget data"""
+        patterns = {
+            'common_labels': [],
+            'numeric_patterns': [],
+            'text_patterns': [],
+            'structural_patterns': []
+        }
         
-        if self.cost_guard:
-            self.cost_guard.reset()
+        # Extract common context labels
+        all_labels = []
+        for cell in budget_book.all_cells:
+            all_labels.extend(cell.context_labels)
         
-        logger.info("LLM session data reset")
+        # Find most common labels
+        from collections import Counter
+        label_counts = Counter(all_labels)
+        patterns['common_labels'] = [label for label, count in label_counts.most_common(10)]
+        
+        # Identify structural patterns
+        for sheet_name, sheet_data in budget_book.sheets_data.items():
+            if sheet_data.get('personnel_entries'):
+                patterns['structural_patterns'].append(f"Personnel section identified in {sheet_name}")
+            if sheet_data.get('expense_categories'):
+                patterns['structural_patterns'].append(f"Expense categories found in {sheet_name}")
+            if sheet_data.get('notes_column'):
+                patterns['structural_patterns'].append(f"Notes column at position {sheet_data['notes_column']} in {sheet_name}")
+        
+        return patterns
     
-    def shutdown(self) -> None:
-        """Shutdown LLM integration and cleanup."""
-        self.field_suggestions.clear()
-        self.enhanced_mappings.clear()
-        self.cost_guard = None
-        self.llm_client = None
-        self.field_detector = None
-        self.cell_resolver = None
-        self.is_initialized = False
+    def _validate_field_detection_result(self, result_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and clean field detection results from LLM"""
+        # Ensure required fields are present
+        if 'fields' not in result_data:
+            result_data['fields'] = []
         
-        logger.info("LLM integration shutdown complete")
-
-
-# Example usage
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+        # Validate each detected field
+        validated_fields = []
+        for field_data in result_data.get('fields', []):
+            if self._is_valid_field_data(field_data):
+                validated_fields.append(field_data)
+        
+        result_data['fields'] = validated_fields
+        return result_data
     
-    print("LLM Integration Manager Example:")
-    print("This component orchestrates all LLM functionality.")
-    print("\nExample usage:")
-    print("""
-    # Initialize manager
-    manager = LLMIntegrationManager()
+    def _validate_cell_resolution_result(self, result_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Validate and clean cell resolution results from LLM"""
+        mappings = result_data.get('mappings', [])
+        validated_mappings = []
+        
+        for mapping in mappings:
+            if self._is_valid_mapping_data(mapping):
+                validated_mappings.append(mapping)
+        
+        return validated_mappings
     
-    # Set up with API key
-    success = manager.initialize_with_api_key("your-api-key", budget_limit=5.0)
+    def _validate_mapping_validation_result(self, result_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate mapping validation results from LLM"""
+        if 'validations' not in result_data:
+            result_data['validations'] = []
+        
+        return result_data
     
-    if success:
-        # Analyze template
-        suggestions = manager.analyze_template_fields(template)
+    def _validate_improvement_suggestions_result(self, result_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate improvement suggestions from LLM"""
+        if 'suggestions' not in result_data:
+            result_data['suggestions'] = []
         
-        # Enhanced field matching
-        mappings = manager.enhanced_field_matching(template, budget_book)
+        return result_data
+    
+    def _validate_context_enhancement_result(self, result_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate context enhancement results from LLM"""
+        required_keys = ['personnel_sections', 'expense_categories', 'descriptive_content', 'relationships']
+        for key in required_keys:
+            if key not in result_data:
+                result_data[key] = []
         
-        # Improve low confidence mappings
-        improved = manager.improve_low_confidence_mappings(mappings, budget_book)
+        return result_data
+    
+    def _is_valid_field_data(self, field_data: Dict[str, Any]) -> bool:
+        """Check if field data is valid"""
+        required_keys = ['placeholder', 'field_type', 'confidence']
+        return all(key in field_data for key in required_keys)
+    
+    def _is_valid_mapping_data(self, mapping_data: Dict[str, Any]) -> bool:
+        """Check if mapping data is valid"""
+        required_keys = ['field_id', 'cell_matches', 'confidence']
+        return all(key in mapping_data for key in required_keys)
+    
+    def _generate_mapping_suggestions(self, mappings: List[Dict[str, Any]]) -> List[str]:
+        """Generate suggestions based on mapping results"""
+        suggestions = []
         
-        # Get usage summary
-        usage = manager.get_usage_summary()
-        print(f"Total cost: ${usage['total_cost']:.4f}")
-    """)
+        low_confidence_mappings = [m for m in mappings if m.get('confidence', 0) < 0.6]
+        if low_confidence_mappings:
+            suggestions.append(f"Review {len(low_confidence_mappings)} low-confidence mappings")
+        
+        unmatched_fields = [m for m in mappings if not m.get('cell_matches')]
+        if unmatched_fields:
+            suggestions.append(f"Manually map {len(unmatched_fields)} unmatched fields")
+        
+        return suggestions
+    
+    def get_analysis_summary(self, results: List[LLMAnalysisResult]) -> Dict[str, Any]:
+        """Generate summary of all LLM analysis results"""
+        total_cost = sum(r.cost_estimate for r in results)
+        total_tokens = sum(r.tokens_used for r in results)
+        successful_analyses = len([r for r in results if r.success])
+        
+        return {
+            'total_analyses': len(results),
+            'successful_analyses': successful_analyses,
+            'total_cost': total_cost,
+            'total_tokens': total_tokens,
+            'average_confidence': sum(r.confidence for r in results) / len(results) if results else 0,
+            'analysis_types': [r.analysis_type for r in results]
+        }
