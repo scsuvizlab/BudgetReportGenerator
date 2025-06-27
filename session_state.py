@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Any, Tuple, Union
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import hashlib
+import re
 
 # Import will be handled after class definitions to avoid circular imports
 # from field_detector import TemplateField
@@ -73,6 +74,35 @@ class PersonnelMappingState:
     extraction_method: str = "automatic"
 
 @dataclass
+class MappingDisplay:
+    """Simple wrapper for mapping display in GUI."""
+    field_name: str = ""
+    mapped: bool = False
+    location: str = ""
+    value: Any = ""
+    confidence: float = 0.0
+    method: str = "none"
+    verified: bool = False
+    template_field: Any = None
+    
+    @property
+    def display_value(self):
+        """GUI compatibility: return display value."""
+        if self.value:
+            return str(self.value)[:100]  # Truncate long values
+        return ""
+    
+    @property
+    def current_value(self):
+        """GUI compatibility: alias for value."""
+        return self.value
+    
+    @property
+    def source(self):
+        """GUI compatibility: return location as source."""
+        return self.location
+
+@dataclass
 class AnalysisQualityMetrics:
     """Quality metrics for the current analysis."""
     total_fields: int = 0
@@ -87,6 +117,364 @@ class AnalysisQualityMetrics:
     personnel_extraction_quality: float = 0.0
     notes_coverage: float = 0.0  # How well notes/descriptions are captured
     overall_quality_score: float = 0.0
+    """Quality metrics for the current analysis."""
+    total_fields: int = 0
+    mapped_fields: int = 0
+    high_confidence_mappings: int = 0
+    medium_confidence_mappings: int = 0
+    low_confidence_mappings: int = 0
+    uncertain_mappings: int = 0
+    user_verified_mappings: int = 0
+    llm_enhanced_mappings: int = 0
+    string_field_coverage: float = 0.0  # Percentage of text fields successfully mapped
+    personnel_extraction_quality: float = 0.0
+    notes_coverage: float = 0.0  # How well notes/descriptions are captured
+    overall_quality_score: float = 0.0
+
+@dataclass
+class TemplateWrapper:
+    """Wrapper for template data with GUI-expected attributes."""
+    fields: List[Any] = field(default_factory=list)
+    source_type: str = "template"
+    source: str = ""
+    description: str = ""
+    file_path: str = ""
+    _content: str = ""
+    
+    def __post_init__(self):
+        """Set default values if not provided."""
+        if not self.source and self.file_path:
+            self.source = Path(self.file_path).name
+        if not self.description and self.fields:
+            self.description = f"Template with {len(self.fields)} fields"
+    
+    @property
+    def placeholders(self):
+        """Backward compatibility: return fields as placeholders for GUI."""
+        return self.fields
+    
+    @property
+    def content(self):
+        """Backward compatibility: return template content for GUI."""
+        return self._content
+    
+    @content.setter
+    def content(self, value):
+        """Set template content."""
+        self._content = value if value else ""
+    
+    @property
+    def filename(self):
+        """GUI compatibility: return filename."""
+        return Path(self.file_path).name if self.file_path else ""
+    
+    @property
+    def name(self):
+        """GUI compatibility: return name (alias for filename)."""
+        return self.filename
+    
+    @property
+    def path(self):
+        """GUI compatibility: return file path."""
+        return self.file_path
+    
+    @property
+    def format(self):
+        """GUI compatibility: return file format."""
+        return Path(self.file_path).suffix.lower() if self.file_path else ""
+    
+    @property
+    def file_type(self):
+        """GUI compatibility: return file type (alias for format)."""
+        return self.format
+    
+    @property
+    def field_count(self):
+        """GUI compatibility: return number of fields."""
+        return len(self.fields)
+    
+    @property
+    def text(self):
+        """GUI compatibility: return text content (alias for content)."""
+        return self.content
+    
+    @property
+    def data(self):
+        """GUI compatibility: return data (returns fields)."""
+        return self.fields
+    
+    @property
+    def metadata(self):
+        """GUI compatibility: return metadata dict."""
+        return {
+            'filename': self.filename,
+            'path': self.file_path,
+            'format': self.format,
+            'field_count': self.field_count,
+            'source_type': self.source_type,
+            'description': self.description
+        }
+
+@dataclass  
+class BudgetWrapper:
+    """Wrapper for budget data with GUI-expected attributes."""
+    data: Dict[str, Any] = field(default_factory=dict)
+    source_type: str = "budget"
+    source: str = ""
+    description: str = ""
+    file_path: str = ""
+    _content: Any = None
+    
+    def __post_init__(self):
+        """Set default values if not provided."""
+        if not self.source and self.file_path:
+            self.source = Path(self.file_path).name
+        if not self.description and self.data:
+            sheet_count = len(self.data.get('sheets', {}))
+            self.description = f"Budget with {sheet_count} sheet(s)"
+    
+    @property
+    def content(self):
+        """Backward compatibility: return budget content for GUI."""
+        return self._content if self._content is not None else self.data
+    
+    @content.setter
+    def content(self, value):
+        """Set budget content."""
+        self._content = value
+    
+    @property
+    def filename(self):
+        """GUI compatibility: return filename."""
+        return Path(self.file_path).name if self.file_path else ""
+    
+    @property
+    def name(self):
+        """GUI compatibility: return name (alias for filename)."""
+        return self.filename
+    
+    @property
+    def path(self):
+        """GUI compatibility: return file path."""
+        return self.file_path
+    
+    @property
+    def format(self):
+        """GUI compatibility: return file format."""
+        return Path(self.file_path).suffix.lower() if self.file_path else ""
+    
+    @property
+    def file_type(self):
+        """GUI compatibility: return file type (alias for format)."""
+        return self.format
+    
+    @property
+    def sheets(self):
+        """GUI compatibility: return sheets data."""
+        return self.data.get('sheets', {})
+    
+    @property
+    def sheet_names(self):
+        """GUI compatibility: return list of sheet names."""
+        return list(self.sheets.keys())
+    
+    @property
+    def sheet_count(self):
+        """GUI compatibility: return number of sheets."""
+        return len(self.sheets)
+    
+    @property
+    def rows(self):
+        """GUI compatibility: return total number of rows across all sheets."""
+        total_rows = 0
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                total_rows += len(sheet_data['data'])
+        return total_rows
+    
+    @property
+    def columns(self):
+        """GUI compatibility: return max number of columns across all sheets."""
+        max_cols = 0
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                sheet_data_rows = sheet_data['data']
+                if sheet_data_rows:
+                    max_cols = max(max_cols, max(len(row) for row in sheet_data_rows))
+        return max_cols
+    
+    @property
+    def cells(self):
+        """GUI compatibility: return cell data for spreadsheet interface."""
+        # Return all cells from all sheets in a format the GUI expects
+        all_cells = {}
+        for sheet_name, sheet_data in self.sheets.items():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                sheet_cells = {}
+                rows = sheet_data['data']
+                for row_idx, row in enumerate(rows):
+                    for col_idx, cell_value in enumerate(row):
+                        # Create cell reference like "A1", "B2", etc.
+                        col_letter = chr(65 + col_idx)  # A, B, C, etc.
+                        cell_ref = f"{col_letter}{row_idx + 1}"
+                        sheet_cells[cell_ref] = cell_value
+                all_cells[sheet_name] = sheet_cells
+        return all_cells
+    
+    @property
+    def values(self):
+        """GUI compatibility: return all values as a flat list."""
+        all_values = []
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                for row in sheet_data['data']:
+                    all_values.extend(row)
+        return all_values
+    
+    @property
+    def worksheets(self):
+        """GUI compatibility: return worksheets (alias for sheets)."""
+        return self.sheets
+    
+    @property
+    def workbook(self):
+        """GUI compatibility: return workbook data."""
+        return self.data
+    
+    @property
+    def raw_data(self):
+        """GUI compatibility: return raw data."""
+        return self.data
+    
+    @property
+    def cell_range(self):
+        """GUI compatibility: return cell range info."""
+        max_row = 0
+        max_col = 0
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                rows = sheet_data['data']
+                if rows:
+                    max_row = max(max_row, len(rows))
+                    max_col = max(max_col, max(len(row) for row in rows))
+        
+        end_col = chr(64 + max_col) if max_col > 0 else 'A'  # Convert to letter
+        return f"A1:{end_col}{max_row}"
+    
+    @property
+    def used_range(self):
+        """GUI compatibility: return used range (alias for cell_range)."""
+        return self.cell_range
+    
+    def get_years(self):
+        """GUI compatibility: extract years from budget data."""
+        years = set()
+        
+        # Look for year patterns in all cell values
+        year_pattern = r'\b(20\d{2})\b'  # Matches years like 2024, 2025, etc.
+        
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                for row in sheet_data['data']:
+                    for cell_value in row:
+                        if isinstance(cell_value, str):
+                            # Look for year patterns in text
+                            year_matches = re.findall(year_pattern, cell_value)
+                            years.update(int(year) for year in year_matches)
+                        elif isinstance(cell_value, (int, float)):
+                            # Check if the number looks like a year
+                            if 2020 <= cell_value <= 2030:
+                                years.add(int(cell_value))
+        
+        # If no years found, return current year as default
+        if not years:
+            from datetime import datetime
+            current_year = datetime.now().year
+            years = {current_year}
+        
+        return sorted(list(years))
+    
+    def get_budget_years(self):
+        """GUI compatibility: alias for get_years()."""
+        return self.get_years()
+    
+    def get_year_data(self, year):
+        """GUI compatibility: get data for a specific year."""
+        # This would need more sophisticated logic based on your budget structure
+        # For now, return all data - could be enhanced to filter by year
+        return self.data
+    
+    def get_total_by_year(self, year=None):
+        """GUI compatibility: get budget totals by year."""
+        # Simple implementation - sum all numeric values
+        total = 0
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                for row in sheet_data['data']:
+                    for cell_value in row:
+                        if isinstance(cell_value, (int, float)):
+                            total += cell_value
+        return total
+    
+    def get_categories(self):
+        """GUI compatibility: get budget categories."""
+        categories = set()
+        
+        # Look for common budget category terms in first column of each sheet
+        category_keywords = [
+            'personnel', 'salary', 'wages', 'equipment', 'supplies', 'travel',
+            'indirect', 'overhead', 'fringe', 'benefits', 'contractual',
+            'participant', 'support', 'other', 'total'
+        ]
+        
+        for sheet_data in self.sheets.values():
+            if isinstance(sheet_data, dict) and 'data' in sheet_data:
+                rows = sheet_data['data']
+                for row in rows:
+                    if row and isinstance(row[0], str):
+                        cell_text = row[0].lower()
+                        for keyword in category_keywords:
+                            if keyword in cell_text:
+                                categories.add(row[0])
+                                break
+        
+        return sorted(list(categories))
+    
+    def get_summary_data(self):
+        """GUI compatibility: get summary of budget data."""
+        return {
+            'filename': self.filename,
+            'years': self.get_years(),
+            'categories': self.get_categories(),
+            'sheet_count': self.sheet_count,
+            'total_rows': self.rows,
+            'total_value': self.get_total_by_year(),
+            'format': self.format
+        }
+    
+    @property
+    def summary(self):
+        """GUI compatibility: return budget summary."""
+        return self.get_summary_data()
+    
+    @property
+    def text(self):
+        """GUI compatibility: return text representation."""
+        return str(self.data)
+    
+    @property
+    def metadata(self):
+        """GUI compatibility: return metadata dict."""
+        return {
+            'filename': self.filename,
+            'path': self.file_path,
+            'format': self.format,
+            'sheet_count': self.sheet_count,
+            'rows': self.rows,
+            'columns': self.columns,
+            'source_type': self.source_type,
+            'description': self.description
+        }
 
 class SessionState:
     """Enhanced session state with focus on string analysis and grant workflows."""
@@ -109,11 +497,13 @@ class SessionState:
         self.template_fields: List[Any] = []  # Will be List[TemplateField] when imported
         self.template_analysis_complete: bool = False
         self.template_hash: Optional[str] = None
+        self._template_wrapper: Optional[TemplateWrapper] = None
         
         # Budget analysis
         self.budget_data: Dict[str, Any] = {}
         self.budget_analysis_complete: bool = False
         self.budget_hash: Optional[str] = None
+        self._budget_wrapper: Optional[BudgetWrapper] = None
         
         # Field mappings
         self.field_mappings: Dict[str, FieldMappingState] = {}
@@ -133,6 +523,16 @@ class SessionState:
         self.llm_tokens_used: int = 0
         self.llm_cost: float = 0.0
         self.llm_enabled: bool = False
+        
+        # LLM configuration - for GUI compatibility
+        self.config = {
+            'llm_enabled': False,
+            'api_key': '',
+            'model': 'gpt-4o-mini',
+            'max_tokens': 1000,
+            'temperature': 0.1,
+            'cost_limit': 5.0
+        }
         
         # String analysis specific
         self.string_analysis_results: Dict[str, Any] = {
@@ -181,13 +581,80 @@ class SessionState:
         self.template_hash = self._calculate_file_hash(template_path)
         self.template_analysis_complete = True
         
-        # Initialize field mappings
-        for field in template_fields:
-            field_name = field.name if hasattr(field, 'name') else str(field)
+        # Read template content for the wrapper
+        template_content = ""
+        try:
+            template_path_str = str(template_path)  # Ensure it's a string
+            if template_path_str.lower().endswith('.txt'):
+                with open(template_path_str, 'r', encoding='utf-8') as f:
+                    template_content = f.read()
+            elif template_path_str.lower().endswith('.md'):
+                with open(template_path_str, 'r', encoding='utf-8') as f:
+                    template_content = f.read()
+            else:
+                # For other formats, use a placeholder or extract text
+                template_content = f"Template content from {Path(template_path_str).name}"
+        except Exception as e:
+            self.logger.warning(f"Could not read template content: {e}")
+            template_content = f"Template from {Path(template_path).name}"
+        
+        # Create template wrapper with GUI-expected attributes
+        self._template_wrapper = TemplateWrapper(
+            fields=template_fields,
+            file_path=template_path,
+            source=Path(template_path).name,
+            description=f"Template with {len(template_fields)} fields from {Path(template_path).name}"
+        )
+        self._template_wrapper.content = template_content
+        
+        # Initialize field mappings - with better field name extraction
+        self.field_mappings = {}  # Clear existing mappings
+        
+        for i, field in enumerate(template_fields):
+            # Extract field name with multiple fallbacks
+            field_name = None
+            
+            if hasattr(field, 'name') and field.name:
+                field_name = str(field.name).strip()
+            elif hasattr(field, 'placeholder_text') and field.placeholder_text:
+                # Extract from placeholder like {field_name} or [field_name]
+                placeholder = str(field.placeholder_text)
+                # Remove common placeholder markers
+                cleaned = placeholder.strip('{}[]()<>')
+                if cleaned:
+                    field_name = cleaned
+            elif hasattr(field, 'context') and field.context:
+                # Try to extract from context
+                context = str(field.context)[:50]  # First 50 chars
+                field_name = f"field_from_context_{i+1}"
+            
+            # Final fallback
+            if not field_name:
+                field_name = f"template_field_{i+1}"
+            
+            # Ensure unique field names
+            original_name = field_name
+            counter = 1
+            while field_name in self.field_mappings:
+                field_name = f"{original_name}_{counter}"
+                counter += 1
+            
+            # Create the mapping
             self.field_mappings[field_name] = FieldMappingState(
                 field_name=field_name,
                 template_field=field
             )
+            
+            # Log field creation for debugging
+            self.logger.debug(f"Created mapping for field {i+1}: '{field_name}' from {type(field)}")
+        
+        self.logger.info(f"Initialized {len(self.field_mappings)} field mappings from {len(template_fields)} template fields")
+        
+        # Auto-match fields if budget is already loaded
+        if self.budget_analysis_complete and self.budget_data:
+            self.logger.info("Both template and budget loaded - performing automatic field matching")
+            matches_found = self.auto_match_fields()
+            self.logger.info(f"Automatic matching found {matches_found} field matches")
         
         self.advance_stage(AnalysisStage.TEMPLATE_LOADED)
         self.workflow_progress['template_validated'] = True
@@ -199,8 +666,23 @@ class SessionState:
         self.budget_hash = self._calculate_file_hash(budget_path)
         self.budget_analysis_complete = True
         
+        # Create budget wrapper with GUI-expected attributes  
+        self._budget_wrapper = BudgetWrapper(
+            data=budget_data,
+            file_path=budget_path,
+            source=Path(budget_path).name,
+            description=f"Budget from {Path(budget_path).name}"
+        )
+        self._budget_wrapper.content = budget_data  # Set the content to the actual data
+        
         # Initialize personnel mappings from budget analysis
         self._initialize_personnel_mappings()
+        
+        # Auto-match fields if template is already loaded
+        if self.template_analysis_complete and self.field_mappings:
+            self.logger.info("Both template and budget loaded - performing automatic field matching")
+            matches_found = self.auto_match_fields()
+            self.logger.info(f"Automatic matching found {matches_found} field matches")
         
         self.advance_stage(AnalysisStage.BUDGET_LOADED)
         self.workflow_progress['budget_structure_understood'] = True
@@ -581,9 +1063,38 @@ class SessionState:
         
         return report
     
-    def save_session(self, file_path: str) -> bool:
+    def save_session(self, file_path: str = None) -> bool:
         """Save session state to file."""
         try:
+            # Provide default file path if none given
+            if file_path is None:
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_path = f"session_{self.session_id}_{timestamp}.json"
+            
+            # Helper function to safely serialize complex objects
+            def safe_serialize(obj):
+                if hasattr(obj, '__dict__'):
+                    # Handle dataclass objects
+                    try:
+                        result = {}
+                        for key, value in obj.__dict__.items():
+                            if isinstance(value, Enum):
+                                result[key] = value.value
+                            elif isinstance(value, datetime):
+                                result[key] = value.isoformat()
+                            elif isinstance(value, list):
+                                result[key] = [safe_serialize(item) for item in value]
+                            elif hasattr(value, '__dict__'):
+                                result[key] = safe_serialize(value)
+                            else:
+                                result[key] = value
+                        return result
+                    except Exception:
+                        return str(obj)
+                else:
+                    return str(obj)
+            
             session_data = {
                 'session_id': self.session_id,
                 'current_stage': self.current_stage.value,
@@ -591,12 +1102,11 @@ class SessionState:
                 'last_updated': self.last_updated.isoformat(),
                 'template_path': self.template_path,
                 'budget_path': self.budget_path,
-                'template_fields': [asdict(field) if hasattr(field, '__dict__') else str(field) 
-                                  for field in self.template_fields],
+                'template_fields': [safe_serialize(field) for field in self.template_fields],
                 'budget_data': self.budget_data,
-                'field_mappings': {k: asdict(v) for k, v in self.field_mappings.items()},
-                'personnel_mappings': {k: asdict(v) for k, v in self.personnel_mappings.items()},
-                'quality_metrics': asdict(self.quality_metrics),
+                'field_mappings': {k: safe_serialize(v) for k, v in self.field_mappings.items()},
+                'personnel_mappings': {k: safe_serialize(v) for k, v in self.personnel_mappings.items()},
+                'quality_metrics': safe_serialize(self.quality_metrics),
                 'workflow_progress': self.workflow_progress,
                 'llm_usage': {
                     'calls_made': self.llm_calls_made,
@@ -701,36 +1211,67 @@ class SessionState:
             issues.append(f"{len(critical_fields)} high-priority fields are unmapped")
         
         return len(issues) == 0, issues
+    
+    def is_ready_for_generation(self) -> bool:
+        """Backward compatibility: GUI expects this method name."""
+        ready, issues = self.is_ready_for_document_generation()
+        return ready
 
     # Backward compatibility properties for existing GUI code
     @property
     def template(self):
-        """Backward compatibility: return template_fields if loaded, None otherwise."""
-        return self.template_fields if self.template_analysis_complete else None
+        """Backward compatibility: return template wrapper with GUI-expected attributes."""
+        return self._template_wrapper if self.template_analysis_complete else None
     
     @template.setter  
     def template(self, value):
         """Backward compatibility: set template_fields."""
         if value is not None:
-            self.template_fields = value
+            if hasattr(value, 'fields'):
+                # It's already a wrapper
+                self.template_fields = value.fields
+                self._template_wrapper = value
+            else:
+                # It's a list of fields
+                self.template_fields = value
+                self._template_wrapper = TemplateWrapper(
+                    fields=value,
+                    source_type="template",
+                    source="template",
+                    description=f"Template with {len(value)} fields"
+                )
             self.template_analysis_complete = True
         else:
             self.template_fields = []
+            self._template_wrapper = None
             self.template_analysis_complete = False
     
     @property
     def budget(self):
-        """Backward compatibility: return budget_data if loaded, None otherwise."""
-        return self.budget_data if self.budget_analysis_complete else None
+        """Backward compatibility: return budget wrapper with GUI-expected attributes."""
+        return self._budget_wrapper if self.budget_analysis_complete else None
     
     @budget.setter
     def budget(self, value):
         """Backward compatibility: set budget_data."""
         if value is not None:
-            self.budget_data = value
+            if hasattr(value, 'data'):
+                # It's already a wrapper
+                self.budget_data = value.data
+                self._budget_wrapper = value
+            else:
+                # It's raw budget data
+                self.budget_data = value
+                self._budget_wrapper = BudgetWrapper(
+                    data=value,
+                    source_type="budget",
+                    source="budget",
+                    description="Budget data"
+                )
             self.budget_analysis_complete = True
         else:
             self.budget_data = {}
+            self._budget_wrapper = None
             self.budget_analysis_complete = False
     
     @property
@@ -738,6 +1279,33 @@ class SessionState:
         """Backward compatibility: return field mappings in old format."""
         return {name: mapping.mapped_value for name, mapping in self.field_mappings.items() 
                 if mapping.mapped_location}
+    
+    @property 
+    def mappings(self):
+        """Backward compatibility: return field mappings for GUI."""
+        # Return ALL fields as MappingDisplay objects for the GUI table
+        mappings = {}
+        
+        self.logger.debug(f"Getting mappings: {len(self.field_mappings)} total field mappings")
+        
+        for field_name, mapping in self.field_mappings.items():
+            mappings[field_name] = MappingDisplay(
+                field_name=field_name,
+                mapped=bool(mapping.mapped_location),
+                location=mapping.mapped_location or "",
+                value=mapping.mapped_value or "",
+                confidence=mapping.confidence,
+                method=mapping.mapping_method,
+                verified=mapping.user_verified,
+                template_field=mapping.template_field
+            )
+            
+            # Debug first few mappings
+            if len(mappings) <= 3:
+                self.logger.debug(f"Mapping {field_name}: mapped={bool(mapping.mapped_location)}, confidence={mapping.confidence}")
+        
+        self.logger.debug(f"Returning {len(mappings)} mappings to GUI")
+        return mappings
     
     @property
     def llm_enabled_flag(self):
@@ -849,6 +1417,323 @@ class SessionState:
     def is_budget_loaded(self):
         """Backward compatibility: check if budget is loaded."""
         return self.budget_analysis_complete
+    
+    def get_field_mapping_status(self):
+        """Backward compatibility: return mapping status for GUI."""
+        mapped_count = len([m for m in self.field_mappings.values() if m.mapped_location])
+        total_count = len(self.field_mappings)
+        
+        return {
+            'total_fields': total_count,
+            'mapped_fields': mapped_count,
+            'unmapped_fields': total_count - mapped_count,
+            'mapping_percentage': (mapped_count / total_count * 100) if total_count > 0 else 0,
+            'ready_for_generation': self.is_ready_for_generation()
+        }
+    
+    def get_field_list(self):
+        """Backward compatibility: return list of field names."""
+        return list(self.field_mappings.keys())
+    
+    def get_unmapped_fields(self):
+        """Backward compatibility: return list of unmapped field names."""
+        return [name for name, mapping in self.field_mappings.items() if not mapping.mapped_location]
+    
+    def get_mapped_fields(self):
+        """Backward compatibility: return list of mapped field names."""
+        return [name for name, mapping in self.field_mappings.items() if mapping.mapped_location]
+    
+    def has_mappings(self):
+        """Backward compatibility: check if any mappings exist."""
+        return len(self.get_mapped_fields()) > 0
+    
+    def auto_match_fields(self):
+        """Backward compatibility: perform automatic field matching."""
+        if not self.budget_data or not self.field_mappings:
+            self.logger.warning("Cannot auto-match: missing budget data or field mappings")
+            return 0
+        
+        self.logger.info(f"Starting auto-match for {len(self.field_mappings)} fields")
+        
+        # Get all budget cell values for matching
+        budget_cells = self._extract_budget_cells()
+        
+        # Perform basic matching for each field
+        matches_found = 0
+        for field_name, mapping in self.field_mappings.items():
+            if mapping.mapped_location:
+                continue  # Skip already mapped fields
+            
+            # Try to find a match for this field
+            best_match = self._find_best_cell_match(mapping, budget_cells)
+            if best_match:
+                location, value, confidence = best_match
+                self.update_field_mapping(
+                    field_name=field_name,
+                    location=location,
+                    value=value,
+                    confidence=confidence,
+                    method="auto_match"
+                )
+                matches_found += 1
+                self.logger.debug(f"Auto-matched '{field_name}' to '{location}': {value} (confidence: {confidence:.2f})")
+        
+        self.logger.info(f"Auto-match completed: {matches_found} fields matched")
+        return matches_found
+    
+    def _extract_budget_cells(self):
+        """Extract all budget cells with their locations and values."""
+        cells = []
+        
+        self.logger.debug(f"Extracting budget cells from data: {type(self.budget_data)}")
+        self.logger.debug(f"Budget data keys: {list(self.budget_data.keys()) if isinstance(self.budget_data, dict) else 'Not a dict'}")
+        
+        if 'sheets' not in self.budget_data:
+            self.logger.warning("No 'sheets' key in budget_data")
+            return cells
+        
+        sheets = self.budget_data.get('sheets', {})
+        self.logger.debug(f"Found {len(sheets)} sheets: {list(sheets.keys())}")
+        
+        for sheet_name, sheet_data in sheets.items():
+            self.logger.debug(f"Processing sheet '{sheet_name}': {type(sheet_data)}")
+            
+            if not isinstance(sheet_data, dict):
+                self.logger.debug(f"Sheet {sheet_name} is not a dict, skipping")
+                continue
+                
+            self.logger.debug(f"Sheet {sheet_name} keys: {list(sheet_data.keys())}")
+            
+            if 'data' not in sheet_data:
+                self.logger.debug(f"No 'data' key in sheet {sheet_name}, trying other keys")
+                # Try alternative keys that might contain the actual data
+                for possible_key in ['rows', 'cells', 'values', 'content']:
+                    if possible_key in sheet_data:
+                        self.logger.debug(f"Found '{possible_key}' in sheet {sheet_name}")
+                        sheet_data['data'] = sheet_data[possible_key]
+                        break
+                else:
+                    self.logger.debug(f"No data found in sheet {sheet_name}")
+                    continue
+            
+            rows = sheet_data['data']
+            self.logger.debug(f"Sheet {sheet_name} has {len(rows)} rows")
+            
+            for row_idx, row in enumerate(rows):
+                if not isinstance(row, (list, tuple)):
+                    self.logger.debug(f"Row {row_idx} is not a list/tuple: {type(row)}")
+                    continue
+                    
+                for col_idx, cell_value in enumerate(row):
+                    if cell_value is not None and str(cell_value).strip():
+                        # Create cell reference
+                        if col_idx < 26:
+                            col_letter = chr(65 + col_idx)  # A, B, C...
+                        else:
+                            col_letter = f"A{chr(65 + col_idx - 26)}"  # AA, AB, AC...
+                        
+                        cell_ref = f"{sheet_name}!{col_letter}{row_idx + 1}"
+                        
+                        cells.append({
+                            'location': cell_ref,
+                            'value': cell_value,
+                            'sheet': sheet_name,
+                            'row': row_idx,
+                            'col': col_idx,
+                            'type': type(cell_value).__name__
+                        })
+                        
+                        # Debug first few cells
+                        if len(cells) <= 5:
+                            self.logger.debug(f"Cell {cell_ref}: '{cell_value}' ({type(cell_value).__name__})")
+        
+        self.logger.debug(f"Extracted {len(cells)} cells from budget data")
+        return cells
+    
+    def _find_best_cell_match(self, field_mapping, budget_cells):
+        """Find the best matching cell for a field."""
+        if not field_mapping.template_field:
+            return None
+        
+        field = field_mapping.template_field
+        field_name = field_mapping.field_name.lower()
+        
+        best_match = None
+        best_score = 0.0
+        
+        # Get field type for type-based matching
+        field_type = getattr(field, 'field_type', 'text')
+        
+        for cell in budget_cells:
+            score = 0.0
+            cell_value = str(cell['value']).strip()
+            cell_value_lower = cell_value.lower()
+            
+            # Name-based matching
+            if any(word in cell_value_lower for word in field_name.split('_')):
+                score += 0.4
+            
+            # Type-based matching
+            if field_type == 'personnel' and self._looks_like_person_name(cell_value):
+                score += 0.6
+            elif field_type == 'currency' and self._looks_like_currency(cell_value):
+                score += 0.6
+            elif field_type == 'numeric' and self._looks_like_number(cell_value):
+                score += 0.5
+            elif field_type == 'description' and len(cell_value) > 30:
+                score += 0.4
+            
+            # Keyword matching based on field name
+            field_keywords = self._get_field_keywords(field_name)
+            for keyword in field_keywords:
+                if keyword in cell_value_lower:
+                    score += 0.3
+                    break
+            
+            # Prefer non-numeric cells for text fields
+            if field_type in ['text', 'personnel', 'description']:
+                if not cell_value.replace('.', '').replace(',', '').isdigit():
+                    score += 0.2
+            
+            if score > best_score and score > 0.3:  # Minimum threshold
+                best_match = (cell['location'], cell['value'], score)
+                best_score = score
+        
+        return best_match
+    
+    def _get_field_keywords(self, field_name):
+        """Get keywords for field matching based on field name."""
+        keywords = field_name.lower().split('_')
+        
+        # Add synonyms
+        keyword_synonyms = {
+            'name': ['investigator', 'person', 'researcher'],
+            'title': ['position', 'role', 'rank'],
+            'project': ['study', 'research', 'grant'],
+            'cost': ['amount', 'price', 'total', 'budget'],
+            'salary': ['wage', 'compensation', 'pay'],
+            'effort': ['fte', 'time', 'percent'],
+            'description': ['detail', 'explain', 'summary'],
+            'institution': ['university', 'organization', 'affiliation']
+        }
+        
+        extended_keywords = keywords.copy()
+        for keyword in keywords:
+            if keyword in keyword_synonyms:
+                extended_keywords.extend(keyword_synonyms[keyword])
+        
+        return extended_keywords
+    
+    def _looks_like_person_name(self, value):
+        """Check if value looks like a person's name."""
+        if not isinstance(value, str) or len(value.strip()) < 3:
+            return False
+        
+        words = value.strip().split()
+        if len(words) < 2 or len(words) > 4:
+            return False
+        
+        # Names typically start with capital letters
+        if not all(word[0].isupper() for word in words if word):
+            return False
+        
+        # Names shouldn't contain numbers
+        if any(char.isdigit() for char in value):
+            return False
+        
+        return True
+    
+    def _looks_like_currency(self, value):
+        """Check if value looks like a currency amount."""
+        value_str = str(value)
+        currency_patterns = [
+            r'\$[\d,]+\.?\d*',
+            r'[\d,]+\.?\d*\s*\$',
+            r'USD\s*[\d,]+\.?\d*',
+            r'[\d,]+\.?\d*\s*dollars?'
+        ]
+        
+        return any(re.search(pattern, value_str, re.IGNORECASE) for pattern in currency_patterns)
+    
+    def _looks_like_number(self, value):
+        """Check if value looks like a number."""
+        try:
+            # Remove common formatting
+            cleaned = re.sub(r'[,%$]', '', str(value).strip())
+            float(cleaned)
+            return True
+        except (ValueError, AttributeError):
+            return False
+    
+    def clear_all_mappings(self):
+        """Backward compatibility: clear all field mappings."""
+        for mapping in self.field_mappings.values():
+            mapping.mapped_location = None
+            mapping.mapped_value = None
+            mapping.confidence = 0.0
+            mapping.mapping_method = "none"
+            mapping.user_verified = False
+        
+        self._update_quality_metrics()
+        self.logger.info("Cleared all field mappings")
+    
+    def refresh_mappings(self):
+        """Backward compatibility: refresh mapping display."""
+        self._update_quality_metrics()
+        return self.mappings
+    
+    def save(self, file_path: str = None):
+        """Backward compatibility: alternative save method for GUI."""
+        return self.save_session(file_path)
+    
+    def auto_save(self):
+        """Backward compatibility: auto-save with default filename."""
+        return self.save_session()
+    
+    def debug_mappings(self):
+        """Debug method to check mapping state."""
+        self.logger.info(f"Debug - Total field mappings: {len(self.field_mappings)}")
+        self.logger.info(f"Debug - Template loaded: {self.template_analysis_complete}")
+        self.logger.info(f"Debug - Budget loaded: {self.budget_analysis_complete}")
+        
+        for i, (field_name, mapping) in enumerate(self.field_mappings.items()):
+            self.logger.info(f"Debug - Field {i+1}: '{field_name}' -> location: {mapping.mapped_location}, confidence: {mapping.confidence}")
+        
+        return {
+            'total_fields': len(self.field_mappings),
+            'template_loaded': self.template_analysis_complete,
+            'budget_loaded': self.budget_analysis_complete,
+            'field_names': list(self.field_mappings.keys())[:5]  # First 5 field names
+        }
+    
+    # LLM Configuration methods for GUI compatibility
+    def get_llm_config(self):
+        """Get LLM configuration for GUI."""
+        return self.config.copy()
+    
+    def set_llm_config(self, config_dict):
+        """Set LLM configuration from GUI."""
+        self.config.update(config_dict)
+        self.llm_enabled = config_dict.get('llm_enabled', False)
+        return True
+    
+    def update_config(self, **kwargs):
+        """Update configuration parameters."""
+        self.config.update(kwargs)
+        if 'llm_enabled' in kwargs:
+            self.llm_enabled = kwargs['llm_enabled']
+        return True
+    
+    def get_config_value(self, key, default=None):
+        """Get a specific config value."""
+        return self.config.get(key, default)
+    
+    def set_config_value(self, key, value):
+        """Set a specific config value."""
+        self.config[key] = value
+        if key == 'llm_enabled':
+            self.llm_enabled = value
+        return True
 
 # Backward compatibility aliases - placed at the very end after all class definitions
 FieldMapping = FieldMappingState
