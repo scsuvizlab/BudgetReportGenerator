@@ -1,540 +1,757 @@
 """
-Enhanced Field Detector - AI-powered template field detection with grant-specific intelligence
-Focuses on detecting personnel, expenses, and contextual fields in grant templates
+Enhanced field detector for template analysis with improved pattern recognition
+for grant proposals and budget justifications. Better handles string-based fields
+like names, titles, descriptions, and notes.
 """
-
 import re
-from typing import Dict, List, Tuple, Any, Optional, Set
 import logging
-from dataclasses import dataclass
-from enum import Enum
-
-class FieldType(Enum):
-    """Types of fields commonly found in grant templates"""
-    PERSONNEL_NAME = "personnel_name"
-    PERSONNEL_TITLE = "personnel_title"
-    PERSONNEL_SALARY = "personnel_salary"
-    PERSONNEL_EFFORT = "personnel_effort"
-    EXPENSE_ITEM = "expense_item"
-    EXPENSE_AMOUNT = "expense_amount"
-    EXPENSE_CATEGORY = "expense_category"
-    DESCRIPTION = "description"
-    NOTES = "notes"
-    DATE = "date"
-    QUANTITY = "quantity"
-    RATE = "rate"
-    TOTAL = "total"
-    YEAR = "year"
-    BUDGET_CATEGORY = "budget_category"
-    JUSTIFICATION = "justification"
-    UNKNOWN = "unknown"
+from typing import Dict, List, Tuple, Set, Optional, Any
+from dataclasses import dataclass, field
+from pathlib import Path
+import docx
+from docx.document import Document
+try:
+    import pypdf
+    from pypdf import PdfReader
+except ImportError:
+    try:
+        import PyPDF2 as pypdf
+        from PyPDF2 import PdfReader
+    except ImportError:
+        pypdf = None
+        PdfReader = None
+import markdown
+from rapidfuzz import fuzz, process
 
 @dataclass
-class DetectedField:
-    """A field detected in a template"""
-    placeholder: str
-    original_text: str
-    field_type: FieldType
-    confidence: float
-    context_before: str
-    context_after: str
-    suggested_mappings: List[str]  # Suggested budget cell mappings
-    grant_specific: bool
-    position: Tuple[int, int]  # Start and end positions in text
+class TemplateField:
+    """Represents a field found in a template document."""
+    name: str
+    placeholder_text: str
+    field_type: str  # 'text', 'numeric', 'currency', 'personnel', 'description', 'date'
+    context: str  # Surrounding text for context
+    position: int  # Position in document
+    confidence: float = 1.0
+    variations: List[str] = field(default_factory=list)
+    requirements: Dict[str, Any] = field(default_factory=dict)
+    
+    # Backward compatibility attributes for GUI
+    source_type: str = "template"  # GUI expects this
+    source: str = ""  # GUI might expect this
+    description: str = ""  # GUI might expect this
+    
+    def __post_init__(self):
+        """Set backward compatibility attributes after initialization."""
+        if not self.source:
+            self.source = self.placeholder_text
+        if not self.description:
+            self.description = self.context[:100] + "..." if len(self.context) > 100 else self.context
 
 @dataclass
 class FieldPattern:
-    """Pattern for detecting specific field types"""
-    field_type: FieldType
-    patterns: List[str]
-    context_patterns: List[str]
-    confidence_boost: float
-    grant_specific: bool = True
+    """Pattern information for field recognition."""
+    pattern_type: str
+    keywords: List[str]
+    context_clues: List[str]
+    field_type: str
+    priority: int = 5  # 1-10, higher is more important
 
-class EnhancedFieldDetector:
-    """Enhanced field detector with grant proposal intelligence"""
+class FieldDetector:
+    """Enhanced field detector with grant-specific pattern recognition."""
     
-    def __init__(self):
+    def __init__(self, enable_debug=False):
+        self.enable_debug = enable_debug
         self.logger = logging.getLogger(__name__)
-        self.field_patterns = self._initialize_field_patterns()
-        self.placeholder_patterns = [
-            r'\{([^}]+)\}',           # {field_name}
-            r'\[([^\]]+)\]',          # [field_name]
-            r'<<([^>]+)>>',           # <<field_name>>
-            r'\$\{([^}]+)\}',         # ${field_name}
-            r'{{([^}]+)}}',           # {{field_name}}
-            r'__([^_]+)__',           # __field_name__
-            r'_([A-Z_][A-Z0-9_]+)_',  # _FIELD_NAME_
-        ]
         
-    def _initialize_field_patterns(self) -> List[FieldPattern]:
-        """Initialize patterns for detecting different field types"""
-        return [
-            # Personnel patterns
+        # Define field patterns for grant proposals
+        self.field_patterns = [
+            # Personnel fields
             FieldPattern(
-                field_type=FieldType.PERSONNEL_NAME,
-                patterns=[
-                    r'name', r'investigator', r'researcher', r'scientist', r'pi\b', r'co.?pi',
-                    r'principal', r'person', r'staff', r'employee', r'faculty', r'director'
-                ],
-                context_patterns=[
-                    r'key personnel', r'project team', r'research team', r'staff list',
-                    r'investigators?', r'personnel table', r'team member'
-                ],
-                confidence_boost=0.3
+                pattern_type='personnel_name',
+                keywords=['investigator', 'pi', 'co-pi', 'name', 'researcher', 'scientist'],
+                context_clues=['principal', 'co-investigator', 'staff', 'personnel', 'team member'],
+                field_type='personnel',
+                priority=9
+            ),
+            FieldPattern(
+                pattern_type='personnel_title',
+                keywords=['title', 'position', 'role', 'rank'],
+                context_clues=['professor', 'assistant', 'associate', 'director', 'postdoc'],
+                field_type='personnel',
+                priority=8
+            ),
+            FieldPattern(
+                pattern_type='personnel_effort',
+                keywords=['effort', 'fte', 'time', 'percent', '%'],
+                context_clues=['commitment', 'allocation', 'dedication'],
+                field_type='numeric',
+                priority=7
             ),
             
+            # Budget and cost fields
             FieldPattern(
-                field_type=FieldType.PERSONNEL_TITLE,
-                patterns=[
-                    r'title', r'position', r'role', r'rank', r'appointment', r'designation'
-                ],
-                context_patterns=[
-                    r'job title', r'academic rank', r'professional title', r'position held'
-                ],
-                confidence_boost=0.3
+                pattern_type='salary_cost',
+                keywords=['salary', 'wage', 'compensation', 'cost', 'amount'],
+                context_clues=['annual', 'monthly', 'hourly', 'total', 'base'],
+                field_type='currency',
+                priority=9
+            ),
+            FieldPattern(
+                pattern_type='equipment_cost',
+                keywords=['equipment', 'instrument', 'computer', 'software', 'hardware'],
+                context_clues=['purchase', 'cost', 'price', 'total'],
+                field_type='currency',
+                priority=8
+            ),
+            FieldPattern(
+                pattern_type='travel_cost',
+                keywords=['travel', 'conference', 'trip', 'transportation'],
+                context_clues=['airfare', 'lodging', 'per diem', 'registration'],
+                field_type='currency',
+                priority=7
             ),
             
+            # Description and justification fields
             FieldPattern(
-                field_type=FieldType.PERSONNEL_SALARY,
-                patterns=[
-                    r'salary', r'wage', r'compensation', r'pay', r'stipend', r'amount',
-                    r'annual', r'monthly', r'hourly', r'rate'
-                ],
-                context_patterns=[
-                    r'personnel cost', r'salary cost', r'compensation table', r'pay scale'
-                ],
-                confidence_boost=0.4
+                pattern_type='description',
+                keywords=['description', 'explain', 'describe', 'detail'],
+                context_clues=['purpose', 'reason', 'justification', 'rationale'],
+                field_type='description',
+                priority=8
+            ),
+            FieldPattern(
+                pattern_type='notes',
+                keywords=['notes', 'comments', 'remarks', 'additional'],
+                context_clues=['information', 'details', 'explanation'],
+                field_type='description',
+                priority=6
+            ),
+            FieldPattern(
+                pattern_type='justification',
+                keywords=['justification', 'justify', 'rationale', 'reason'],
+                context_clues=['necessary', 'required', 'essential', 'purpose'],
+                field_type='description',
+                priority=9
             ),
             
+            # Project information
             FieldPattern(
-                field_type=FieldType.PERSONNEL_EFFORT,
-                patterns=[
-                    r'effort', r'percent', r'time', r'fte', r'commitment', r'allocation',
-                    r'percentage', r'dedication'
-                ],
-                context_patterns=[
-                    r'percent effort', r'time commitment', r'effort percentage', r'fte allocation'
-                ],
-                confidence_boost=0.4
+                pattern_type='project_title',
+                keywords=['project', 'title', 'study', 'research'],
+                context_clues=['name', 'called', 'entitled'],
+                field_type='text',
+                priority=9
+            ),
+            FieldPattern(
+                pattern_type='institution',
+                keywords=['institution', 'university', 'organization', 'company'],
+                context_clues=['affiliation', 'employer', 'workplace'],
+                field_type='text',
+                priority=7
             ),
             
-            # Expense patterns
+            # Time-related fields
             FieldPattern(
-                field_type=FieldType.EXPENSE_ITEM,
-                patterns=[
-                    r'item', r'equipment', r'supply', r'material', r'tool', r'instrument',
-                    r'software', r'license', r'subscription', r'service'
-                ],
-                context_patterns=[
-                    r'equipment list', r'supplies needed', r'materials required', 
-                    r'itemized', r'line item'
-                ],
-                confidence_boost=0.3
+                pattern_type='duration',
+                keywords=['duration', 'period', 'timeline', 'months', 'years'],
+                context_clues=['project', 'study', 'research', 'length'],
+                field_type='numeric',
+                priority=6
             ),
-            
             FieldPattern(
-                field_type=FieldType.EXPENSE_AMOUNT,
-                patterns=[
-                    r'cost', r'price', r'amount', r'value', r'total', r'sum', r'expense',
-                    r'budget', r'dollar', r'usd', r'fee'
-                ],
-                context_patterns=[
-                    r'unit cost', r'total cost', r'estimated cost', r'budget amount',
-                    r'expense total'
-                ],
-                confidence_boost=0.4
-            ),
-            
-            FieldPattern(
-                field_type=FieldType.EXPENSE_CATEGORY,
-                patterns=[
-                    r'category', r'type', r'class', r'group', r'classification',
-                    r'equipment', r'travel', r'supplies', r'personnel', r'indirect',
-                    r'direct', r'overhead'
-                ],
-                context_patterns=[
-                    r'budget category', r'expense type', r'cost category', r'classification'
-                ],
-                confidence_boost=0.3
-            ),
-            
-            # Description and notes patterns
-            FieldPattern(
-                field_type=FieldType.DESCRIPTION,
-                patterns=[
-                    r'description', r'details', r'specification', r'summary', r'overview',
-                    r'explanation', r'info', r'information'
-                ],
-                context_patterns=[
-                    r'item description', r'detailed description', r'brief description'
-                ],
-                confidence_boost=0.2
-            ),
-            
-            FieldPattern(
-                field_type=FieldType.NOTES,
-                patterns=[
-                    r'notes?', r'comments?', r'remarks?', r'memo', r'additional',
-                    r'justification', r'rationale', r'purpose'
-                ],
-                context_patterns=[
-                    r'additional notes', r'comments section', r'remarks field',
-                    r'justification text'
-                ],
-                confidence_boost=0.2
-            ),
-            
-            FieldPattern(
-                field_type=FieldType.JUSTIFICATION,
-                patterns=[
-                    r'justification', r'rationale', r'reason', r'explanation', r'why',
-                    r'necessity', r'importance', r'significance'
-                ],
-                context_patterns=[
-                    r'budget justification', r'cost justification', r'expense rationale'
-                ],
-                confidence_boost=0.4
-            ),
-            
-            # Temporal patterns
-            FieldPattern(
-                field_type=FieldType.YEAR,
-                patterns=[
-                    r'year', r'yr', r'annual', r'fy', r'fiscal', r'period', r'term'
-                ],
-                context_patterns=[
-                    r'budget year', r'fiscal year', r'project year', r'year \d+'
-                ],
-                confidence_boost=0.3
-            ),
-            
-            FieldPattern(
-                field_type=FieldType.DATE,
-                patterns=[
-                    r'date', r'when', r'time', r'start', r'end', r'begin', r'finish',
-                    r'deadline', r'due'
-                ],
-                context_patterns=[
-                    r'start date', r'end date', r'project timeline', r'schedule'
-                ],
-                confidence_boost=0.2
-            ),
-            
-            # Quantitative patterns
-            FieldPattern(
-                field_type=FieldType.QUANTITY,
-                patterns=[
-                    r'quantity', r'qty', r'number', r'count', r'units?', r'how.?many',
-                    r'amount'
-                ],
-                context_patterns=[
-                    r'quantity needed', r'number of units', r'item count'
-                ],
-                confidence_boost=0.3
-            ),
-            
-            FieldPattern(
-                field_type=FieldType.RATE,
-                patterns=[
-                    r'rate', r'per', r'each', r'unit', r'hourly', r'daily', r'weekly',
-                    r'monthly', r'annually'
-                ],
-                context_patterns=[
-                    r'hourly rate', r'unit rate', r'cost per', r'rate per'
-                ],
-                confidence_boost=0.3
-            ),
-            
-            FieldPattern(
-                field_type=FieldType.TOTAL,
-                patterns=[
-                    r'total', r'sum', r'grand', r'overall', r'final', r'aggregate',
-                    r'combined', r'subtotal'
-                ],
-                context_patterns=[
-                    r'grand total', r'total cost', r'total amount', r'final total'
-                ],
-                confidence_boost=0.4
+                pattern_type='dates',
+                keywords=['date', 'start', 'end', 'begin', 'finish'],
+                context_clues=['project', 'period', 'timeline'],
+                field_type='date',
+                priority=6
             )
         ]
-    
-    def detect_fields(self, template_text: str) -> List[DetectedField]:
-        """Detect all fields in template text"""
-        detected_fields = []
         
-        # Find all placeholder patterns
+        # Common placeholder patterns
+        self.placeholder_patterns = [
+            r'\{([^}]+)\}',  # {field_name}
+            r'\[\[([^\]]+)\]\]',  # [[field_name]]
+            r'\[([^\]]+)\]',  # [field_name]
+            r'<<([^>]+)>>',  # <<field_name>>
+            r'{{([^}]+)}}',  # {{field_name}}
+            r'<([^>]+)>',  # <field_name>
+            r'_+([A-Za-z_\s]+)_+',  # ___field_name___
+            r'\.\.\.([A-Za-z_\s]+)\.\.\.',  # ...field_name...
+        ]
+        
+        # Grant-specific terminology
+        self.grant_terminology = {
+            'personnel_categories': [
+                'principal investigator', 'pi', 'co-principal investigator', 'co-pi',
+                'co-investigator', 'senior personnel', 'key personnel', 'postdoc',
+                'graduate student', 'undergraduate student', 'research scientist',
+                'research associate', 'technician', 'staff scientist'
+            ],
+            'cost_categories': [
+                'personnel', 'fringe benefits', 'equipment', 'travel', 'participant support',
+                'other direct costs', 'total direct costs', 'facilities and administrative',
+                'indirect costs', 'total project costs', 'supplies', 'contractual'
+            ],
+            'time_units': [
+                'calendar months', 'academic months', 'summer months', 'person months',
+                'full-time equivalent', 'fte', 'percent effort', '% effort'
+            ]
+        }
+    
+    def analyze_template(self, template_path: str) -> List[TemplateField]:
+        """Analyze a template document to identify fields that need to be filled."""
+        template_path = Path(template_path)
+        
+        if not template_path.exists():
+            raise FileNotFoundError(f"Template file not found: {template_path}")
+        
+        self.logger.info(f"Analyzing template: {template_path}")
+        
+        # Extract text based on file type
+        if template_path.suffix.lower() == '.docx':
+            text = self._extract_docx_text(template_path)
+        elif template_path.suffix.lower() == '.pdf':
+            text = self._extract_pdf_text(template_path)
+        elif template_path.suffix.lower() in ['.md', '.markdown']:
+            text = self._extract_markdown_text(template_path)
+        elif template_path.suffix.lower() == '.txt':
+            text = self._extract_txt_text(template_path)
+        else:
+            raise ValueError(f"Unsupported template format: {template_path.suffix}")
+        
+        # Find explicit placeholders
+        explicit_fields = self._find_explicit_placeholders(text)
+        
+        # Find implicit fields through pattern analysis
+        implicit_fields = self._find_implicit_fields(text)
+        
+        # Combine and deduplicate fields
+        all_fields = self._merge_field_lists(explicit_fields, implicit_fields)
+        
+        # Enhance fields with context and type information
+        enhanced_fields = self._enhance_fields(all_fields, text)
+        
+        # Sort by priority and confidence
+        enhanced_fields.sort(key=lambda x: (x.confidence, -x.position), reverse=True)
+        
+        self.logger.info(f"Found {len(enhanced_fields)} template fields")
+        return enhanced_fields
+    
+    def _extract_docx_text(self, file_path: Path) -> str:
+        """Extract text from a Word document."""
+        try:
+            doc = docx.Document(file_path)
+            paragraphs = []
+            
+            for paragraph in doc.paragraphs:
+                if paragraph.text.strip():
+                    paragraphs.append(paragraph.text)
+            
+            # Also extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        if cell.text.strip():
+                            paragraphs.append(cell.text)
+            
+            return '\n'.join(paragraphs)
+        except Exception as e:
+            self.logger.error(f"Error extracting DOCX text: {e}")
+            raise
+    
+    def _extract_pdf_text(self, file_path: Path) -> str:
+        """Extract text from a PDF document."""
+        if not pypdf or not PdfReader:
+            raise ImportError("PDF support requires 'pypdf' or 'PyPDF2' package. Install with: pip install pypdf")
+        
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PdfReader(file)
+                text_parts = []
+                
+                for page in pdf_reader.pages:
+                    text_parts.append(page.extract_text())
+                
+                return '\n'.join(text_parts)
+        except Exception as e:
+            self.logger.error(f"Error extracting PDF text: {e}")
+            raise
+    
+    def _extract_markdown_text(self, file_path: Path) -> str:
+        """Extract text from a Markdown document."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+            
+            # Convert markdown to plain text (basic approach)
+            # Remove markdown syntax
+            content = re.sub(r'^#+\s+', '', content, flags=re.MULTILINE)  # Headers
+            content = re.sub(r'\*\*(.*?)\*\*', r'\1', content)  # Bold
+            content = re.sub(r'\*(.*?)\*', r'\1', content)  # Italic
+            content = re.sub(r'`(.*?)`', r'\1', content)  # Inline code
+            content = re.sub(r'^\s*-\s+', '', content, flags=re.MULTILINE)  # List items
+            
+            return content
+        except Exception as e:
+            self.logger.error(f"Error extracting Markdown text: {e}")
+            raise
+    
+    def _extract_txt_text(self, file_path: Path) -> str:
+        """Extract text from a plain text file."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        except UnicodeDecodeError:
+            # Try with different encoding
+            with open(file_path, 'r', encoding='latin-1') as file:
+                return file.read()
+    
+    def _find_explicit_placeholders(self, text: str) -> List[TemplateField]:
+        """Find explicit placeholder patterns in the text."""
+        fields = []
+        position = 0
+        
         for pattern in self.placeholder_patterns:
-            matches = re.finditer(pattern, template_text, re.IGNORECASE)
+            matches = re.finditer(pattern, text, re.IGNORECASE)
             
             for match in matches:
-                placeholder = match.group(0)
-                field_content = match.group(1)
-                start_pos = match.start()
-                end_pos = match.end()
+                field_name = match.group(1).strip()
+                placeholder_text = match.group(0)
                 
                 # Get context around the placeholder
-                context_before = self._extract_context(template_text, start_pos, -50)
-                context_after = self._extract_context(template_text, end_pos, 50)
+                start_pos = max(0, match.start() - 50)
+                end_pos = min(len(text), match.end() + 50)
+                context = text[start_pos:end_pos]
                 
-                # Analyze the field
-                field_type, confidence, grant_specific = self._analyze_field(
-                    field_content, context_before, context_after
-                )
+                # Determine field type based on name and context
+                field_type = self._determine_field_type(field_name, context)
                 
-                # Generate suggested mappings
-                suggested_mappings = self._generate_mapping_suggestions(
-                    field_content, field_type, context_before, context_after
-                )
-                
-                detected_field = DetectedField(
-                    placeholder=placeholder,
-                    original_text=field_content,
+                field = TemplateField(
+                    name=field_name,
+                    placeholder_text=placeholder_text,
                     field_type=field_type,
-                    confidence=confidence,
-                    context_before=context_before,
-                    context_after=context_after,
-                    suggested_mappings=suggested_mappings,
-                    grant_specific=grant_specific,
-                    position=(start_pos, end_pos)
+                    context=context,
+                    position=match.start(),
+                    confidence=0.95
                 )
                 
-                detected_fields.append(detected_field)
+                fields.append(field)
+                position += 1
         
-        # Sort by position in document
-        detected_fields.sort(key=lambda x: x.position[0])
-        
-        self.logger.info(f"Detected {len(detected_fields)} fields in template")
-        return detected_fields
+        return fields
     
-    def _extract_context(self, text: str, position: int, length: int) -> str:
-        """Extract context text around a position"""
-        if length > 0:  # Context after
-            end_pos = min(position + length, len(text))
-            context = text[position:end_pos]
-        else:  # Context before
-            start_pos = max(0, position + length)
-            context = text[start_pos:position]
+    def _find_implicit_fields(self, text: str) -> List[TemplateField]:
+        """Find implicit fields through pattern analysis and context."""
+        fields = []
+        sentences = re.split(r'[.!?]+', text)
         
-        return context.strip()
+        for i, sentence in enumerate(sentences):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # Look for patterns that suggest missing information
+            implicit_patterns = [
+                r'(name|title|position)\s*[:;]?\s*$',  # Ends with field label
+                r'(amount|cost|total|salary)\s*[:;]?\s*\$?\s*$',  # Ends with money field
+                r'(description|explain|describe|details?)\s*[:;]?\s*$',  # Ends with description request
+                r'(note|comment|remark)s?\s*[:;]?\s*$',  # Ends with notes request
+                r'(justify|justification|rationale)\s*[:;]?\s*$',  # Ends with justification request
+            ]
+            
+            for pattern in implicit_patterns:
+                match = re.search(pattern, sentence, re.IGNORECASE)
+                if match:
+                    field_name = match.group(1)
+                    field_type = self._determine_field_type(field_name, sentence)
+                    
+                    # Calculate position in original text
+                    position = text.find(sentence)
+                    
+                    field = TemplateField(
+                        name=field_name.lower(),
+                        placeholder_text=f"[{field_name}]",
+                        field_type=field_type,
+                        context=sentence,
+                        position=position if position >= 0 else i * 100,
+                        confidence=0.7
+                    )
+                    
+                    fields.append(field)
+        
+        # Also look for grant-specific patterns
+        grant_fields = self._find_grant_specific_patterns(text)
+        fields.extend(grant_fields)
+        
+        return fields
     
-    def _analyze_field(self, field_content: str, context_before: str, 
-                      context_after: str) -> Tuple[FieldType, float, bool]:
-        """Analyze a field to determine its type and confidence"""
-        field_lower = field_content.lower()
-        context_text = (context_before + " " + context_after).lower()
+    def _find_grant_specific_patterns(self, text: str) -> List[TemplateField]:
+        """Find patterns specific to grant proposals and budget justifications."""
+        fields = []
         
-        best_match = None
-        best_confidence = 0.0
-        is_grant_specific = False
+        # Look for personnel-related blanks or incomplete information
+        personnel_patterns = [
+            r'(principal investigator|pi)\s*[:;]?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)?\s*$',
+            r'(co-?investigator|co-?pi)\s*[:;]?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)?\s*$',
+            r'(postdoc|graduate student|staff)\s*[:;]?\s*([A-Z][a-z]+\s+[A-Z][a-z]+)?\s*$',
+        ]
         
-        # Check each pattern
-        for pattern_def in self.field_patterns:
-            confidence = 0.0
-            
-            # Check main patterns
-            for pattern in pattern_def.patterns:
-                if re.search(pattern, field_lower):
-                    confidence += 0.3
-                    break
-            
-            # Check context patterns
-            for context_pattern in pattern_def.context_patterns:
-                if re.search(context_pattern, context_text):
-                    confidence += pattern_def.confidence_boost
-                    break
-            
-            # Additional confidence for exact matches
-            if field_lower in [p.replace(r'\b', '').replace('\\', '') 
-                              for p in pattern_def.patterns]:
-                confidence += 0.2
-            
-            # Grant-specific boost
-            if pattern_def.grant_specific:
-                grant_indicators = [
-                    'grant', 'proposal', 'nsf', 'nih', 'award', 'funding',
-                    'budget', 'personnel', 'investigator'
-                ]
-                for indicator in grant_indicators:
-                    if indicator in context_text:
-                        confidence += 0.1
-                        is_grant_specific = True
-                        break
-            
-            if confidence > best_confidence:
-                best_confidence = confidence
-                best_match = pattern_def.field_type
-                if pattern_def.grant_specific:
-                    is_grant_specific = True
+        for pattern in personnel_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                role = match.group(1)
+                name = match.group(2) if len(match.groups()) > 1 else None
+                
+                if not name:  # Missing name - this is a field
+                    field = TemplateField(
+                        name=f"{role.lower()}_name",
+                        placeholder_text=f"[{role} Name]",
+                        field_type='personnel',
+                        context=match.group(0),
+                        position=match.start(),
+                        confidence=0.8
+                    )
+                    fields.append(field)
         
-        # Default classification if no pattern matches
-        if best_match is None:
-            best_match = self._classify_by_name(field_content)
-            best_confidence = 0.3
+        # Look for cost tables or budget sections with missing values
+        budget_patterns = [
+            r'(salary|wage|cost|amount|total)\s*[:;]?\s*\$?\s*_+',  # Salary: ____
+            r'(equipment|supplies|travel)\s*[:;]?\s*\$?\s*_+',  # Equipment: ____
+            r'(indirect|overhead)\s*rate\s*[:;]?\s*_+\s*%?',  # Indirect rate: ___%
+        ]
         
-        return best_match, min(best_confidence, 1.0), is_grant_specific
+        for pattern in budget_patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                category = match.group(1)
+                field_type = 'currency' if 'rate' not in match.group(0).lower() else 'numeric'
+                
+                field = TemplateField(
+                    name=f"{category.lower()}_amount",
+                    placeholder_text=f"[{category} Amount]",
+                    field_type=field_type,
+                    context=match.group(0),
+                    position=match.start(),
+                    confidence=0.75
+                )
+                fields.append(field)
+        
+        return fields
     
-    def _classify_by_name(self, field_name: str) -> FieldType:
-        """Classify field by name when no patterns match"""
-        name_lower = field_name.lower()
+    def _determine_field_type(self, field_name: str, context: str) -> str:
+        """Determine the type of field based on name and context."""
+        field_name_lower = field_name.lower()
+        context_lower = context.lower()
         
-        # Simple heuristics based on common naming conventions
-        if any(word in name_lower for word in ['name', 'person', 'who']):
-            return FieldType.PERSONNEL_NAME
-        elif any(word in name_lower for word in ['title', 'position', 'role']):
-            return FieldType.PERSONNEL_TITLE
-        elif any(word in name_lower for word in ['cost', 'price', 'amount', 'dollar']):
-            return FieldType.EXPENSE_AMOUNT
-        elif any(word in name_lower for word in ['item', 'equipment', 'supply']):
-            return FieldType.EXPENSE_ITEM
-        elif any(word in name_lower for word in ['note', 'comment', 'description']):
-            return FieldType.DESCRIPTION
-        elif any(word in name_lower for word in ['year', 'date', 'time']):
-            return FieldType.YEAR
+        # Check against known patterns
+        for pattern in self.field_patterns:
+            # Check if field name matches pattern keywords
+            name_match = any(keyword in field_name_lower for keyword in pattern.keywords)
+            
+            # Check if context matches pattern context clues
+            context_match = any(clue in context_lower for clue in pattern.context_clues)
+            
+            if name_match or context_match:
+                return pattern.field_type
+        
+        # Fallback logic
+        if any(term in field_name_lower for term in ['name', 'investigator', 'pi', 'staff']):
+            return 'personnel'
+        elif any(term in field_name_lower for term in ['cost', 'amount', 'salary', 'budget', '$']):
+            return 'currency'
+        elif any(term in field_name_lower for term in ['percent', '%', 'rate', 'effort', 'fte']):
+            return 'numeric'
+        elif any(term in field_name_lower for term in ['description', 'notes', 'explain', 'justify']):
+            return 'description'
+        elif any(term in field_name_lower for term in ['date', 'start', 'end', 'begin']):
+            return 'date'
         else:
-            return FieldType.UNKNOWN
+            return 'text'
     
-    def _generate_mapping_suggestions(self, field_content: str, field_type: FieldType,
-                                    context_before: str, context_after: str) -> List[str]:
-        """Generate suggestions for mapping this field to budget data"""
-        suggestions = []
+    def _merge_field_lists(self, explicit_fields: List[TemplateField], 
+                          implicit_fields: List[TemplateField]) -> List[TemplateField]:
+        """Merge explicit and implicit field lists, removing duplicates."""
+        all_fields = explicit_fields.copy()
         
-        field_lower = field_content.lower()
-        context_text = (context_before + " " + context_after).lower()
+        for implicit_field in implicit_fields:
+            # Check if this field is already covered by an explicit field
+            is_duplicate = False
+            
+            for explicit_field in explicit_fields:
+                # Check name similarity
+                name_similarity = fuzz.ratio(implicit_field.name.lower(), 
+                                           explicit_field.name.lower())
+                
+                # Check position proximity (within 100 characters)
+                position_close = abs(implicit_field.position - explicit_field.position) < 100
+                
+                if name_similarity > 80 or position_close:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                all_fields.append(implicit_field)
         
-        # Generate suggestions based on field type
-        if field_type == FieldType.PERSONNEL_NAME:
-            suggestions.extend([
-                "Look for cells containing names (e.g., 'John Smith', 'Dr. Johnson')",
-                "Check cells near 'investigator', 'PI', or 'researcher' labels",
-                "Look for cells with title patterns (Dr., Prof., Mr., Ms.)",
-                "Search in personnel or staff sections of budget"
-            ])
-            
-        elif field_type == FieldType.PERSONNEL_TITLE:
-            suggestions.extend([
-                "Look for job titles (Professor, Research Scientist, etc.)",
-                "Check cells near name entries",
-                "Look for academic ranks or professional designations",
-                "Search for cells containing 'investigator', 'staff', 'specialist'"
-            ])
-            
-        elif field_type == FieldType.PERSONNEL_SALARY:
-            suggestions.extend([
-                "Look for numeric values in salary/wage columns",
-                "Check cells with dollar amounts near personnel names",
-                "Look for annual, monthly, or hourly rate values",
-                "Search in compensation or pay sections"
-            ])
-            
-        elif field_type == FieldType.PERSONNEL_EFFORT:
-            suggestions.extend([
-                "Look for percentage values (e.g., 25%, 0.25)",
-                "Check cells near 'effort', 'time', or 'FTE' labels",
-                "Look for decimal values between 0 and 1",
-                "Search in effort allocation sections"
-            ])
-            
-        elif field_type == FieldType.EXPENSE_ITEM:
-            suggestions.extend([
-                "Look for equipment or supply names",
-                "Check item description columns",
-                "Look for product names or model numbers",
-                "Search in materials or equipment sections"
-            ])
-            
-        elif field_type == FieldType.EXPENSE_AMOUNT:
-            suggestions.extend([
-                "Look for dollar amounts or costs",
-                "Check numeric values in cost columns",
-                "Look for price information",
-                "Search for budget amounts or totals"
-            ])
-            
-        elif field_type == FieldType.DESCRIPTION or field_type == FieldType.NOTES:
-            suggestions.extend([
-                "Look in notes or description columns (often rightmost)",
-                "Check cells with longer text content",
-                "Look for justification or explanation text",
-                "Search in comments or details sections"
-            ])
-            
-        elif field_type == FieldType.YEAR:
-            suggestions.extend([
-                "Look for 4-digit year values (e.g., 2024, 2025)",
-                "Check cells with year labels",
-                "Look for fiscal year designations",
-                "Search in timeline or schedule sections"
-            ])
-            
-        # Add context-specific suggestions
-        if 'total' in context_text:
-            suggestions.append("Look for sum or total values")
-        if 'unit' in context_text:
-            suggestions.append("Look for per-unit costs or quantities")
-        if 'annual' in context_text:
-            suggestions.append("Look for yearly amounts")
-        
-        # Add field-name specific suggestions
-        if field_lower:
-            suggestions.append(f"Search for cells containing or near '{field_content}'")
-        
-        return suggestions[:6]  # Limit to top 6 suggestions
+        return all_fields
     
-    def get_fields_by_type(self, detected_fields: List[DetectedField], 
-                          field_type: FieldType) -> List[DetectedField]:
-        """Get all detected fields of a specific type"""
-        return [field for field in detected_fields if field.field_type == field_type]
+    def _enhance_fields(self, fields: List[TemplateField], text: str) -> List[TemplateField]:
+        """Enhance fields with additional context and requirements."""
+        enhanced_fields = []
+        
+        for field in fields:
+            # Generate variations of the field name
+            variations = self._generate_field_variations(field.name)
+            field.variations = variations
+            
+            # Determine requirements based on field type and context
+            requirements = self._determine_field_requirements(field, text)
+            field.requirements = requirements
+            
+            # Adjust confidence based on context quality
+            field.confidence = self._calculate_field_confidence(field, text)
+            
+            enhanced_fields.append(field)
+        
+        return enhanced_fields
     
-    def get_high_confidence_fields(self, detected_fields: List[DetectedField], 
-                                 min_confidence: float = 0.7) -> List[DetectedField]:
-        """Get fields with high confidence scores"""
-        return [field for field in detected_fields if field.confidence >= min_confidence]
-    
-    def get_grant_specific_fields(self, detected_fields: List[DetectedField]) -> List[DetectedField]:
-        """Get fields that are specifically related to grant proposals"""
-        return [field for field in detected_fields if field.grant_specific]
-    
-    def generate_field_summary(self, detected_fields: List[DetectedField]) -> Dict[str, Any]:
-        """Generate a summary of detected fields"""
-        field_type_counts = {}
-        for field in detected_fields:
-            field_type_name = field.field_type.value
-            field_type_counts[field_type_name] = field_type_counts.get(field_type_name, 0) + 1
+    def _generate_field_variations(self, field_name: str) -> List[str]:
+        """Generate variations of a field name for better matching."""
+        variations = [field_name]
         
-        high_confidence_count = len(self.get_high_confidence_fields(detected_fields))
-        grant_specific_count = len(self.get_grant_specific_fields(detected_fields))
+        # Convert between naming conventions
+        # snake_case to camelCase
+        camel_case = re.sub(r'_([a-z])', lambda m: m.group(1).upper(), field_name)
+        if camel_case != field_name:
+            variations.append(camel_case)
         
-        return {
-            'total_fields': len(detected_fields),
-            'field_types': field_type_counts,
-            'high_confidence_fields': high_confidence_count,
-            'grant_specific_fields': grant_specific_count,
-            'average_confidence': sum(f.confidence for f in detected_fields) / len(detected_fields) if detected_fields else 0
-        }
-    
-    def suggest_improvements(self, detected_fields: List[DetectedField]) -> List[str]:
-        """Suggest improvements for field detection"""
-        suggestions = []
+        # snake_case to Title Case
+        title_case = field_name.replace('_', ' ').title()
+        if title_case != field_name:
+            variations.append(title_case)
         
-        low_confidence_fields = [f for f in detected_fields if f.confidence < 0.5]
-        if low_confidence_fields:
-            suggestions.append(f"Consider reviewing {len(low_confidence_fields)} low-confidence field(s)")
-        
-        unknown_fields = self.get_fields_by_type(detected_fields, FieldType.UNKNOWN)
-        if unknown_fields:
-            suggestions.append(f"Classify {len(unknown_fields)} unknown field type(s) manually")
-        
-        # Check for common missing field types in grant proposals
-        field_types_present = {f.field_type for f in detected_fields}
-        important_grant_fields = {
-            FieldType.PERSONNEL_NAME, FieldType.PERSONNEL_SALARY, 
-            FieldType.EXPENSE_ITEM, FieldType.EXPENSE_AMOUNT
+        # Add common synonyms
+        synonyms = {
+            'name': ['full_name', 'person_name', 'investigator_name'],
+            'title': ['position', 'role', 'job_title'],
+            'cost': ['amount', 'price', 'total', 'expense'],
+            'description': ['desc', 'details', 'explanation'],
+            'notes': ['comments', 'remarks', 'additional_info'],
+            'effort': ['fte', 'time_commitment', 'percent_effort'],
+            'salary': ['wage', 'compensation', 'pay'],
         }
         
-        missing_important = important_grant_fields - field_types_present
-        if missing_important:
-            missing_names = [ft.value for ft in missing_important]
-            suggestions.append(f"Consider adding fields for: {', '.join(missing_names)}")
+        for base_term, synonym_list in synonyms.items():
+            if base_term in field_name.lower():
+                for synonym in synonym_list:
+                    variations.append(field_name.lower().replace(base_term, synonym))
+        
+        return list(set(variations))  # Remove duplicates
+    
+    def _determine_field_requirements(self, field: TemplateField, text: str) -> Dict[str, Any]:
+        """Determine requirements and constraints for a field."""
+        requirements = {
+            'required': True,
+            'data_type': field.field_type,
+            'max_length': None,
+            'format_pattern': None,
+            'validation_rules': []
+        }
+        
+        # Set requirements based on field type
+        if field.field_type == 'personnel':
+            requirements.update({
+                'max_length': 100,
+                'validation_rules': ['must_be_person_name'],
+                'format_pattern': r'^[A-Za-z\s\.,\-]+$'
+            })
+        elif field.field_type == 'currency':
+            requirements.update({
+                'validation_rules': ['must_be_positive_number'],
+                'format_pattern': r'^\$?[\d,]+\.?\d*$'
+            })
+        elif field.field_type == 'numeric':
+            if 'percent' in field.name.lower() or '%' in field.context:
+                requirements.update({
+                    'validation_rules': ['must_be_percentage'],
+                    'format_pattern': r'^\d+\.?\d*%?$'
+                })
+        elif field.field_type == 'description':
+            requirements.update({
+                'max_length': 1000,
+                'validation_rules': ['must_not_be_empty']
+            })
+        elif field.field_type == 'date':
+            requirements.update({
+                'format_pattern': r'^\d{1,2}/\d{1,2}/\d{4}$',
+                'validation_rules': ['must_be_valid_date']
+            })
+        
+        # Check context for additional requirements
+        context_lower = field.context.lower()
+        if 'required' in context_lower or 'mandatory' in context_lower:
+            requirements['required'] = True
+        elif 'optional' in context_lower:
+            requirements['required'] = False
+        
+        return requirements
+    
+    def _calculate_field_confidence(self, field: TemplateField, text: str) -> float:
+        """Calculate confidence score for field detection."""
+        confidence = field.confidence
+        
+        # Adjust based on field name clarity
+        if len(field.name) < 3:
+            confidence *= 0.8  # Very short names are less reliable
+        elif len(field.name) > 50:
+            confidence *= 0.9  # Very long names might be noise
+        
+        # Adjust based on context quality
+        context_words = len(field.context.split())
+        if context_words < 3:
+            confidence *= 0.9  # Little context
+        elif context_words > 20:
+            confidence *= 1.1  # Rich context
+        
+        # Boost confidence for grant-specific terminology
+        context_lower = field.context.lower()
+        for category, terms in self.grant_terminology.items():
+            if any(term in context_lower for term in terms):
+                confidence *= 1.1
+                break
+        
+        # Penalize fields that might be false positives
+        false_positive_indicators = [
+            'example', 'sample', 'template', 'placeholder', 'dummy'
+        ]
+        if any(indicator in field.name.lower() for indicator in false_positive_indicators):
+            confidence *= 0.7
+        
+        return min(confidence, 1.0)
+    
+    def suggest_field_mappings(self, template_fields: List[TemplateField], 
+                             budget_text_values: List[Tuple[str, str, Any]]) -> Dict[str, List[Tuple[str, float]]]:
+        """Suggest mappings between template fields and budget values."""
+        suggestions = {}
+        
+        for field in template_fields:
+            field_suggestions = []
+            
+            # For each text value in the budget, calculate match score
+            for location, sheet_name, value in budget_text_values:
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                
+                match_score = self._calculate_field_match_score(field, value)
+                
+                if match_score > 0.3:  # Minimum threshold
+                    field_suggestions.append((location, match_score))
+            
+            # Sort by match score
+            field_suggestions.sort(key=lambda x: x[1], reverse=True)
+            
+            # Keep top 5 suggestions
+            suggestions[field.name] = field_suggestions[:5]
         
         return suggestions
+    
+    def _calculate_field_match_score(self, field: TemplateField, value: str) -> float:
+        """Calculate how well a budget value matches a template field."""
+        score = 0.0
+        
+        # Direct name matching
+        for field_variation in [field.name] + field.variations:
+            similarity = fuzz.partial_ratio(field_variation.lower(), value.lower())
+            score = max(score, similarity / 100.0 * 0.4)
+        
+        # Type-based matching
+        if field.field_type == 'personnel':
+            if self._looks_like_person_name(value):
+                score += 0.6
+        elif field.field_type == 'currency':
+            if self._looks_like_currency(value):
+                score += 0.6
+        elif field.field_type == 'description':
+            if len(value) > 50:  # Long text likely to be description
+                score += 0.4
+        elif field.field_type == 'numeric':
+            if self._looks_like_number(value):
+                score += 0.5
+        
+        # Context-based matching
+        # Check if value contains words from field context
+        field_context_words = set(re.findall(r'\w+', field.context.lower()))
+        value_words = set(re.findall(r'\w+', value.lower()))
+        
+        common_words = field_context_words.intersection(value_words)
+        if common_words:
+            context_score = len(common_words) / max(len(field_context_words), 1)
+            score += context_score * 0.3
+        
+        return min(score, 1.0)
+    
+    def _looks_like_person_name(self, value: str) -> bool:
+        """Check if value looks like a person's name."""
+        if not isinstance(value, str) or len(value.strip()) < 3:
+            return False
+        
+        # Simple heuristics
+        words = value.strip().split()
+        if len(words) < 2 or len(words) > 4:
+            return False
+        
+        # Names typically start with capital letters
+        if not all(word[0].isupper() for word in words if word):
+            return False
+        
+        # Names shouldn't contain numbers
+        if any(char.isdigit() for char in value):
+            return False
+        
+        return True
+    
+    def _looks_like_currency(self, value: str) -> bool:
+        """Check if value looks like a currency amount."""
+        currency_patterns = [
+            r'\$[\d,]+\.?\d*',
+            r'[\d,]+\.?\d*\s*\$',
+            r'USD\s*[\d,]+\.?\d*',
+            r'[\d,]+\.?\d*\s*dollars?'
+        ]
+        
+        return any(re.search(pattern, value, re.IGNORECASE) for pattern in currency_patterns)
+    
+    def _looks_like_number(self, value: str) -> bool:
+        """Check if value looks like a number."""
+        try:
+            # Remove common formatting
+            cleaned = re.sub(r'[,%$]', '', value.strip())
+            float(cleaned)
+            return True
+        except ValueError:
+            return False
+    
+    def get_field_summary(self, fields: List[TemplateField]) -> Dict[str, Any]:
+        """Get a summary of detected fields for reporting."""
+        type_counts = {}
+        confidence_levels = {'high': 0, 'medium': 0, 'low': 0}
+        
+        for field in fields:
+            # Count by type
+            field_type = field.field_type
+            type_counts[field_type] = type_counts.get(field_type, 0) + 1
+            
+            # Count by confidence level
+            if field.confidence >= 0.8:
+                confidence_levels['high'] += 1
+            elif field.confidence >= 0.5:
+                confidence_levels['medium'] += 1
+            else:
+                confidence_levels['low'] += 1
+        
+        return {
+            'total_fields': len(fields),
+            'field_types': type_counts,
+            'confidence_distribution': confidence_levels,
+            'high_priority_fields': [f.name for f in fields if f.confidence >= 0.8],
+            'requires_attention': [f.name for f in fields if f.confidence < 0.5]
+        }

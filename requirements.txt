@@ -30,6 +30,22 @@ pytest>=7.0.0           # Unit testing framework
 mypy>=1.0.0             # Static type checking
 ruff>=0.1.0             # Python linting and formatting
 
+# For legacy Excel file support (.xls files)
+xlrd>=2.0.1
+
+# For PDF template processing (choose one)
+pypdf>=3.0.1
+# OR alternatively:
+# PyPDF2>=3.0.1
+
+# For enhanced fuzzy string matching (already in your requirements, but ensure version)
+rapidfuzz>=3.0.0
+
+# Optional: For more advanced text processing
+python-docx>=0.8.11
+openpyxl>=3.1.0
+pandas>=2.0.0
+
 # Platform-specific notes for keyring:
 # Windows: Works out of the box with Windows Credential Manager
 # macOS: Uses Keychain, works out of the box

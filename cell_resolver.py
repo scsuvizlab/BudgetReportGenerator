@@ -1,545 +1,832 @@
 """
-Enhanced Cell Resolver - Intelligent mapping between template fields and budget cells
-Uses context awareness, proximity matching, and grant-specific intelligence
+AI-powered budget cell matching with enhanced string analysis and contextual field detection.
+Improved to better handle names, positions, notes, and grant-specific terminology.
 """
-
 import re
-from typing import Dict, List, Tuple, Any, Optional, Set
 import logging
+from typing import Dict, List, Tuple, Optional, Any, Set
 from dataclasses import dataclass
-from enum import Enum
-import difflib
-from collections import defaultdict
-
-# Import the enhanced structures
-from enhanced_budget_book import CellData, EnhancedBudgetBook
-from enhanced_field_detector import DetectedField, FieldType
+from rapidfuzz import fuzz, process
+import pandas as pd
 
 @dataclass
-class CellMatch:
-    """A potential match between a template field and a budget cell"""
-    cell: CellData
-    field: DetectedField
+class CellContext:
+    """Contains contextual information about a cell and its surroundings."""
+    value: Any
+    row: int
+    col: int
+    nearby_text: List[str]
+    column_header: Optional[str]
+    row_header: Optional[str]
+    context_type: str  # 'numeric', 'text', 'mixed', 'empty'
+    confidence: float = 0.0
+
+@dataclass
+class FieldMatch:
+    """Represents a matched field with contextual information."""
+    field_name: str
+    cell_address: str
+    value: Any
+    context: CellContext
+    match_type: str  # 'exact', 'fuzzy', 'contextual', 'keyword'
     confidence: float
-    match_reasons: List[str]
-    proximity_score: float
-    context_score: float
-    semantic_score: float
-    final_score: float
+    notes: str = ""
 
-@dataclass
-class ResolutionResult:
-    """Result of cell resolution process"""
-    field: DetectedField
-    primary_match: Optional[CellMatch]
-    alternative_matches: List[CellMatch]
-    resolution_confidence: float
-    needs_manual_review: bool
-    suggestions: List[str]
-
-class MatchType(Enum):
-    """Types of matches found"""
-    EXACT_MATCH = "exact"
-    SEMANTIC_MATCH = "semantic"
-    PROXIMITY_MATCH = "proximity"
-    CONTEXT_MATCH = "context"
-    FUZZY_MATCH = "fuzzy"
-    HEURISTIC_MATCH = "heuristic"
-
-class EnhancedCellResolver:
-    """Enhanced cell resolver with intelligent matching capabilities"""
+class CellResolver:
+    """Enhanced cell resolver with improved string analysis and contextual matching."""
     
-    def __init__(self, budget_book: EnhancedBudgetBook):
-        self.budget_book = budget_book
+    def __init__(self, llm_client=None, enable_debug=False):
+        self.llm_client = llm_client
+        self.enable_debug = enable_debug
         self.logger = logging.getLogger(__name__)
-        self.semantic_patterns = self._initialize_semantic_patterns()
-        self.proximity_weights = self._initialize_proximity_weights()
         
-    def _initialize_semantic_patterns(self) -> Dict[FieldType, Dict[str, List[str]]]:
-        """Initialize semantic patterns for different field types"""
-        return {
-            FieldType.PERSONNEL_NAME: {
-                'exact': ['name', 'investigator', 'researcher', 'pi', 'person'],
-                'partial': ['staff', 'faculty', 'team', 'personnel', 'employee'],
-                'indicators': ['dr', 'prof', 'mr', 'ms', 'mrs', 'phd', 'md']
-            },
-            
-            FieldType.PERSONNEL_TITLE: {
-                'exact': ['title', 'position', 'role', 'rank'],
-                'partial': ['professor', 'scientist', 'analyst', 'specialist', 'director'],
-                'indicators': ['investigator', 'researcher', 'manager', 'coordinator']
-            },
-            
-            FieldType.PERSONNEL_SALARY: {
-                'exact': ['salary', 'wage', 'pay', 'compensation', 'cost'],
-                'partial': ['annual', 'monthly', 'hourly', 'rate', 'amount'],
-                'indicators': ['$', 'dollar', 'usd', 'total', 'sum']
-            },
-            
-            FieldType.PERSONNEL_EFFORT: {
-                'exact': ['effort', 'percent', 'percentage', 'fte', 'time'],
-                'partial': ['commitment', 'allocation', 'dedication'],
-                'indicators': ['%', 'pct', '0.', 'full', 'part']
-            },
-            
-            FieldType.EXPENSE_ITEM: {
-                'exact': ['item', 'equipment', 'supply', 'material', 'tool'],
-                'partial': ['instrument', 'device', 'software', 'license', 'product'],
-                'indicators': ['model', 'brand', 'type', 'version', 'unit']
-            },
-            
-            FieldType.EXPENSE_AMOUNT: {
-                'exact': ['cost', 'price', 'amount', 'total', 'expense'],
-                'partial': ['budget', 'value', 'sum', 'fee', 'charge'],
-                'indicators': ['$', 'dollar', 'usd', 'each', 'per']
-            },
-            
-            FieldType.DESCRIPTION: {
-                'exact': ['description', 'details', 'summary', 'explanation'],
-                'partial': ['info', 'information', 'specification', 'overview'],
-                'indicators': ['brief', 'detailed', 'full', 'complete']
-            },
-            
-            FieldType.NOTES: {
-                'exact': ['notes', 'note', 'comments', 'remarks', 'memo'],
-                'partial': ['additional', 'extra', 'supplemental', 'other'],
-                'indicators': ['see', 'refer', 'include', 'also']
-            },
-            
-            FieldType.JUSTIFICATION: {
-                'exact': ['justification', 'rationale', 'reason', 'why'],
-                'partial': ['explanation', 'necessity', 'importance', 'purpose'],
-                'indicators': ['because', 'needed', 'required', 'essential']
-            }
+        # Grant-specific terminology patterns
+        self.personnel_keywords = {
+            'investigator': ['investigator', 'pi', 'principal investigator', 'co-investigator', 'co-pi'],
+            'staff': ['staff', 'personnel', 'employee', 'researcher', 'associate'],
+            'key_personnel': ['key personnel', 'key staff', 'senior personnel', 'core team'],
+            'specialist': ['specialist', 'expert', 'consultant', 'advisor', 'technician'],
+            'postdoc': ['postdoc', 'post-doc', 'postdoctoral', 'fellow'],
+            'graduate': ['graduate', 'grad student', 'phd student', 'doctoral'],
+            'undergraduate': ['undergraduate', 'undergrad', 'student assistant']
         }
-    
-    def _initialize_proximity_weights(self) -> Dict[str, float]:
-        """Initialize weights for proximity-based matching"""
-        return {
-            'same_row': 0.8,
-            'adjacent_row': 0.6,
-            'same_column': 0.4,
-            'adjacent_column': 0.3,
-            'diagonal': 0.2,
-            'nearby': 0.1
+        
+        self.expense_categories = {
+            'equipment': ['equipment', 'instrument', 'hardware', 'computer', 'software'],
+            'travel': ['travel', 'conference', 'meeting', 'trip', 'transportation', 'lodging'],
+            'supplies': ['supplies', 'materials', 'consumables', 'reagents', 'chemicals'],
+            'release_time': ['release time', 'course release', 'teaching release', 'buy-out'],
+            'overhead': ['overhead', 'indirect', 'facilities', 'administrative'],
+            'fringe': ['fringe', 'benefits', 'insurance', 'retirement']
         }
+        
+        # Common note column identifiers
+        self.note_column_patterns = [
+            'notes', 'note', 'description', 'desc', 'comments', 'comment', 
+            'details', 'explanation', 'justification', 'remarks', 'memo'
+        ]
+        
+        # Enhanced string analysis patterns
+        self.name_patterns = [
+            r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b',  # First Last
+            r'\b[A-Z][a-z]+,\s*[A-Z][a-z]+\b',  # Last, First
+            r'\b[A-Z][a-z]+\s+[A-Z]\.\s*[A-Z][a-z]+\b',  # First M. Last
+            r'\bDr\.\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b',  # Dr. Name
+        ]
+        
+        self.title_patterns = [
+            r'principal\s+investigator', r'pi\b', r'co-?pi\b',
+            r'co-?investigator', r'research\s+(?:scientist|associate|professor)',
+            r'post-?doc(?:toral)?(?:\s+(?:fellow|researcher))?',
+            r'graduate\s+(?:student|research\s+assistant|assistant)',
+            r'undergraduate\s+(?:student|research\s+assistant)',
+            r'technician', r'specialist', r'coordinator', r'manager',
+            r'professor', r'assistant\s+professor', r'associate\s+professor',
+        ]
+        
+        # Patterns for identifying currency and numeric values
+        self.currency_patterns = [
+            r'\$[\d,]+\.?\d*',  # $1,234.56
+            r'[\d,]+\.?\d*\s*\$',  # 1,234.56 $
+            r'[\d,]+\.?\d*\s*dollars?',  # 1234 dollars
+            r'USD\s*[\d,]+\.?\d*'  # USD 1234
+        ]
+        
+    def analyze_spreadsheet_context(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze the entire spreadsheet to understand its structure and context."""
+        context = {
+            'total_rows': len(df),
+            'total_cols': len(df.columns),
+            'numeric_columns': [],
+            'text_columns': [],
+            'mixed_columns': [],
+            'potential_note_columns': [],
+            'personnel_sections': [],
+            'expense_sections': [],
+            'header_rows': []
+        }
+        
+        # Analyze column types and patterns
+        for col_idx in range(len(df.columns)):
+            col_data = df.iloc[:, col_idx].dropna()
+            col_name = df.columns[col_idx] if col_idx < len(df.columns) else f"Column_{col_idx}"
+            
+            if col_data.empty:
+                continue
+                
+            numeric_count = sum(pd.api.types.is_numeric_dtype(type(val)) or 
+                              self._is_currency_value(str(val)) for val in col_data)
+            text_count = sum(isinstance(val, str) and not self._is_currency_value(val) 
+                           for val in col_data)
+            
+            total_count = len(col_data)
+            if numeric_count / total_count > 0.8:
+                context['numeric_columns'].append((col_idx, col_name))
+            elif text_count / total_count > 0.8:
+                context['text_columns'].append((col_idx, col_name))
+            else:
+                context['mixed_columns'].append((col_idx, col_name))
+            
+            # Check for note columns (typically rightmost text columns)
+            if (isinstance(col_name, str) and 
+                any(pattern in col_name.lower() for pattern in self.note_column_patterns)):
+                context['potential_note_columns'].append((col_idx, col_name))
+        
+        # Identify personnel and expense sections
+        context['personnel_sections'] = self._find_section_patterns(df, self.personnel_keywords)
+        context['expense_sections'] = self._find_section_patterns(df, self.expense_categories)
+        
+        # Find potential header rows
+        context['header_rows'] = self._identify_header_rows(df)
+        
+        return context
     
-    def resolve_fields(self, detected_fields: List[DetectedField]) -> List[ResolutionResult]:
-        """Resolve all detected fields to budget cells"""
-        resolution_results = []
+    def resolve_field_mappings(self, df: pd.DataFrame, template_fields: List[str]) -> List[FieldMatch]:
+        """Resolve field mappings with enhanced string analysis and contextual matching."""
+        context = self.analyze_spreadsheet_context(df)
+        matches = []
         
-        # Get all budget cells for analysis
-        all_cells = self.budget_book.all_cells
+        # Create cell contexts for all non-empty cells
+        cell_contexts = self._create_cell_contexts(df, context)
         
-        for field in detected_fields:
-            self.logger.info(f"Resolving field: {field.placeholder}")
-            
-            # Find potential matches
-            potential_matches = self._find_potential_matches(field, all_cells)
-            
-            # Score and rank matches
-            scored_matches = self._score_matches(field, potential_matches)
-            
-            # Determine best match and alternatives
-            primary_match = scored_matches[0] if scored_matches else None
-            alternative_matches = scored_matches[1:5]  # Top 4 alternatives
-            
-            # Calculate overall confidence
-            resolution_confidence = primary_match.final_score if primary_match else 0.0
-            
-            # Determine if manual review is needed
-            needs_manual_review = (
-                not primary_match or 
-                resolution_confidence < 0.6 or
-                (len(scored_matches) > 1 and scored_matches[1].final_score > 0.7)
-            )
-            
-            # Generate suggestions
-            suggestions = self._generate_resolution_suggestions(field, scored_matches)
-            
-            result = ResolutionResult(
-                field=field,
-                primary_match=primary_match,
-                alternative_matches=alternative_matches,
-                resolution_confidence=resolution_confidence,
-                needs_manual_review=needs_manual_review,
-                suggestions=suggestions
-            )
-            
-            resolution_results.append(result)
+        for field in template_fields:
+            try:
+                best_matches = self._find_field_matches(field, cell_contexts, df, context)
+                matches.extend(best_matches)
+            except Exception as e:
+                self.logger.warning(f"Field matching failed for field {field}: {e}")
         
-        self.logger.info(f"Resolved {len(resolution_results)} fields")
-        return resolution_results
+        # Post-process matches to resolve conflicts and improve confidence
+        matches = self._resolve_match_conflicts(matches)
+        
+        return matches
     
-    def _find_potential_matches(self, field: DetectedField, all_cells: List[CellData]) -> List[CellData]:
-        """Find potential cell matches for a field"""
-        potential_matches = []
+    def _create_cell_contexts(self, df: pd.DataFrame, spreadsheet_context: Dict) -> List[CellContext]:
+        """Create contextual information for each cell in the spreadsheet."""
+        contexts = []
         
-        # Get semantic patterns for this field type
-        patterns = self.semantic_patterns.get(field.field_type, {})
+        for row_idx in range(len(df)):
+            for col_idx in range(len(df.columns)):
+                value = df.iloc[row_idx, col_idx]
+                
+                # Skip empty cells
+                if pd.isna(value) or (isinstance(value, str) and not value.strip()):
+                    continue
+                
+                # Gather nearby text for context
+                nearby_text = self._get_nearby_text(df, row_idx, col_idx, radius=2)
+                
+                # Determine context type
+                context_type = self._determine_context_type(value, nearby_text)
+                
+                # Get column and row headers
+                column_header = df.columns[col_idx] if col_idx < len(df.columns) else None
+                row_header = self._get_row_header(df, row_idx)
+                
+                context = CellContext(
+                    value=value,
+                    row=row_idx,
+                    col=col_idx,
+                    nearby_text=nearby_text,
+                    column_header=column_header,
+                    row_header=row_header,
+                    context_type=context_type
+                )
+                
+                contexts.append(context)
         
-        for cell in all_cells:
-            if self._is_potential_match(field, cell, patterns):
-                potential_matches.append(cell)
-        
-        return potential_matches
+        return contexts
     
-    def _is_potential_match(self, field: DetectedField, cell: CellData, 
-                           patterns: Dict[str, List[str]]) -> bool:
-        """Check if a cell could potentially match a field"""
-        # Skip empty cells
-        if not cell.value:
+    def _find_field_matches(self, field: str, cell_contexts: List[CellContext], 
+                           df: pd.DataFrame, spreadsheet_context: Dict) -> List[FieldMatch]:
+        """Find the best matches for a given field using multiple strategies."""
+        candidates = []
+        
+        # Strategy 1: Direct field name matching
+        candidates.extend(self._match_by_field_name(field, cell_contexts))
+        
+        # Strategy 2: Keyword-based matching
+        candidates.extend(self._match_by_keywords(field, cell_contexts))
+        
+        # Strategy 3: Contextual pattern matching
+        candidates.extend(self._match_by_context_patterns(field, cell_contexts, spreadsheet_context))
+        
+        # Strategy 4: Positional and proximity matching
+        candidates.extend(self._match_by_position(field, cell_contexts, df))
+        
+        # Strategy 5: LLM-powered matching (if available)
+        if self.llm_client:
+            candidates.extend(self._match_with_llm(field, cell_contexts, df))
+        
+        # Rank and filter candidates
+        ranked_candidates = self._rank_candidates(candidates, field)
+        
+        # Return top matches (usually just 1, but could be multiple for high confidence)
+        return ranked_candidates[:3] if ranked_candidates else []
+    
+    def _match_by_field_name(self, field: str, cell_contexts: List[CellContext]) -> List[FieldMatch]:
+        """Match fields by direct name comparison."""
+        matches = []
+        field_lower = field.lower()
+        
+        for context in cell_contexts:
+            if isinstance(context.value, str):
+                value_lower = context.value.lower().strip()
+                
+                # Exact match
+                if value_lower == field_lower:
+                    matches.append(FieldMatch(
+                        field_name=field,
+                        cell_address=f"R{context.row}C{context.col}",
+                        value=context.value,
+                        context=context,
+                        match_type='exact',
+                        confidence=0.95,
+                        notes="Exact field name match"
+                    ))
+                
+                # High similarity match
+                similarity = fuzz.ratio(value_lower, field_lower)
+                if similarity > 80:
+                    matches.append(FieldMatch(
+                        field_name=field,
+                        cell_address=f"R{context.row}C{context.col}",
+                        value=context.value,
+                        context=context,
+                        match_type='fuzzy',
+                        confidence=similarity / 100.0,
+                        notes=f"Fuzzy name match (similarity: {similarity}%)"
+                    ))
+        
+        return matches
+    
+    def _match_by_keywords(self, field: str, cell_contexts: List[CellContext]) -> List[FieldMatch]:
+        """Match fields based on keyword patterns and domain knowledge."""
+        matches = []
+        field_lower = field.lower()
+        
+        # Determine field category
+        field_category = self._categorize_field(field_lower)
+        
+        for context in cell_contexts:
+            # Check the cell value itself
+            match_score = self._calculate_keyword_match_score(field_lower, context, field_category)
+            
+            if match_score > 0.6:
+                matches.append(FieldMatch(
+                    field_name=field,
+                    cell_address=f"R{context.row}C{context.col}",
+                    value=context.value,
+                    context=context,
+                    match_type='keyword',
+                    confidence=match_score,
+                    notes=f"Keyword match in category: {field_category}"
+                ))
+        
+        return matches
+    
+    def _match_by_context_patterns(self, field: str, cell_contexts: List[CellContext], 
+                                  spreadsheet_context: Dict) -> List[FieldMatch]:
+        """Match fields based on contextual patterns and spreadsheet structure."""
+        matches = []
+        field_lower = field.lower()
+        
+        # Look for notes in rightmost columns
+        if any(note_term in field_lower for note_term in ['note', 'description', 'comment']):
+            for col_idx, col_name in spreadsheet_context['potential_note_columns']:
+                for context in cell_contexts:
+                    if context.col == col_idx and isinstance(context.value, str) and len(context.value) > 20:
+                        matches.append(FieldMatch(
+                            field_name=field,
+                            cell_address=f"R{context.row}C{context.col}",
+                            value=context.value,
+                            context=context,
+                            match_type='contextual',
+                            confidence=0.8,
+                            notes="Found in potential notes column"
+                        ))
+        
+        # Look for personnel information in personnel sections
+        if any(person_term in field_lower for person_term in ['name', 'investigator', 'staff']):
+            for section_info in spreadsheet_context['personnel_sections']:
+                start_row, end_row, category = section_info
+                for context in cell_contexts:
+                    if (start_row <= context.row <= end_row and 
+                        isinstance(context.value, str) and 
+                        self._looks_like_person_name(context.value)):
+                        
+                        matches.append(FieldMatch(
+                            field_name=field,
+                            cell_address=f"R{context.row}C{context.col}",
+                            value=context.value,
+                            context=context,
+                            match_type='contextual',
+                            confidence=0.75,
+                            notes=f"Found in personnel section: {category}"
+                        ))
+        
+        return matches
+    
+    def _match_by_position(self, field: str, cell_contexts: List[CellContext], 
+                          df: pd.DataFrame) -> List[FieldMatch]:
+        """Match fields based on positional relationships and proximity to labels."""
+        matches = []
+        field_lower = field.lower()
+        
+        for context in cell_contexts:
+            # Look for labels to the left or above
+            proximity_score = self._calculate_proximity_score(field_lower, context, df)
+            
+            if proximity_score > 0.5:
+                matches.append(FieldMatch(
+                    field_name=field,
+                    cell_address=f"R{context.row}C{context.col}",
+                    value=context.value,
+                    context=context,
+                    match_type='contextual',
+                    confidence=proximity_score,
+                    notes="Found near relevant label"
+                ))
+        
+        return matches
+    
+    def _match_with_llm(self, field: str, cell_contexts: List[CellContext], 
+                       df: pd.DataFrame) -> List[FieldMatch]:
+        """Use LLM for sophisticated contextual matching."""
+        if not self.llm_client:
+            return []
+        
+        matches = []
+        
+        # Prepare context for LLM
+        context_sample = self._prepare_llm_context(field, cell_contexts[:50], df)
+        
+        try:
+            prompt = f"""Analyze this spreadsheet data to find the best match for the field "{field}".
+            
+Context: This is a grant budget spreadsheet. Look for:
+- People's names and titles near personnel-related fields
+- Dollar amounts near budget categories  
+- Notes and descriptions in text fields
+- Relationships between labels and values
+
+Spreadsheet sample:
+{context_sample}
+
+Return the most likely cell coordinates and confidence score (0-1) for the field "{field}".
+Focus on string values like names, titles, and descriptions, not just numbers."""
+            
+            response = self.llm_client.analyze_context(prompt, max_tokens=500)
+            
+            # Parse LLM response and create matches
+            llm_matches = self._parse_llm_response(response, field, cell_contexts)
+            matches.extend(llm_matches)
+            
+        except Exception as e:
+            self.logger.warning(f"LLM matching failed for field {field}: {e}")
+        
+        return matches
+    
+    def _is_currency_value(self, value_str: str) -> bool:
+        """Check if a string represents a currency value."""
+        if not isinstance(value_str, str):
             return False
         
-        cell_text = str(cell.value).lower()
-        context_text = ' '.join(cell.context_labels).lower()
-        column_text = cell.column_name.lower()
-        
-        # Check for exact field name match
-        field_name = field.original_text.lower()
-        if field_name in cell_text or field_name in context_text or field_name in column_text:
-            return True
-        
-        # Check semantic patterns
-        for pattern_type, pattern_list in patterns.items():
-            for pattern in pattern_list:
-                if (pattern in cell_text or pattern in context_text or 
-                    pattern in column_text):
-                    return True
-        
-        # Type-specific matching
-        if field.field_type in [FieldType.PERSONNEL_SALARY, FieldType.EXPENSE_AMOUNT, 
-                               FieldType.PERSONNEL_EFFORT, FieldType.QUANTITY]:
-            # For numeric fields, check if cell contains numbers
-            if cell.data_type in ['numeric', 'mixed']:
-                return True
-        
-        elif field.field_type in [FieldType.PERSONNEL_NAME, FieldType.PERSONNEL_TITLE,
-                                 FieldType.EXPENSE_ITEM, FieldType.DESCRIPTION, FieldType.NOTES]:
-            # For text fields, check if cell contains substantial text
-            if cell.data_type in ['text', 'mixed'] and len(str(cell.value)) > 2:
-                return True
-        
-        # Check if cell is in notes column (for description/notes fields)
-        if (field.field_type in [FieldType.DESCRIPTION, FieldType.NOTES, FieldType.JUSTIFICATION] and
-            hasattr(self.budget_book, 'sheets_data')):
-            for sheet_data in self.budget_book.sheets_data.values():
-                if sheet_data.get('notes_column') == cell.col:
-                    return True
-        
-        return False
+        return any(re.search(pattern, value_str.strip()) for pattern in self.currency_patterns)
     
-    def _score_matches(self, field: DetectedField, potential_matches: List[CellData]) -> List[CellMatch]:
-        """Score and rank potential matches"""
-        scored_matches = []
+    def _get_nearby_text(self, df: pd.DataFrame, row: int, col: int, radius: int = 2) -> List[str]:
+        """Get text from nearby cells for context."""
+        nearby_text = []
         
-        for cell in potential_matches:
-            # Calculate component scores
-            semantic_score = self._calculate_semantic_score(field, cell)
-            context_score = self._calculate_context_score(field, cell)
-            proximity_score = self._calculate_proximity_score(field, cell)
-            
-            # Calculate final score (weighted combination)
-            final_score = (
-                semantic_score * 0.4 +
-                context_score * 0.35 +
-                proximity_score * 0.25
-            )
-            
-            # Determine match reasons
-            match_reasons = self._determine_match_reasons(field, cell, semantic_score, 
-                                                        context_score, proximity_score)
-            
-            # Create match object
-            match = CellMatch(
-                cell=cell,
-                field=field,
-                confidence=cell.confidence,
-                match_reasons=match_reasons,
-                proximity_score=proximity_score,
-                context_score=context_score,
-                semantic_score=semantic_score,
-                final_score=final_score
-            )
-            
-            scored_matches.append(match)
+        for r_offset in range(-radius, radius + 1):
+            for c_offset in range(-radius, radius + 1):
+                if r_offset == 0 and c_offset == 0:
+                    continue
+                
+                target_row = row + r_offset
+                target_col = col + c_offset
+                
+                if (0 <= target_row < len(df) and 0 <= target_col < len(df.columns)):
+                    value = df.iloc[target_row, target_col]
+                    if isinstance(value, str) and value.strip():
+                        nearby_text.append(value.strip())
         
-        # Sort by final score (descending)
-        scored_matches.sort(key=lambda x: x.final_score, reverse=True)
-        
-        return scored_matches
+        return nearby_text
     
-    def _calculate_semantic_score(self, field: DetectedField, cell: CellData) -> float:
-        """Calculate semantic similarity score"""
+    def _determine_context_type(self, value: Any, nearby_text: List[str]) -> str:
+        """Determine the type of context for a cell."""
+        if pd.api.types.is_numeric_dtype(type(value)) or self._is_currency_value(str(value)):
+            return 'numeric'
+        elif isinstance(value, str):
+            if any(self._is_currency_value(text) for text in nearby_text):
+                return 'mixed'
+            else:
+                return 'text'
+        else:
+            return 'empty'
+    
+    def _get_row_header(self, df: pd.DataFrame, row_idx: int) -> Optional[str]:
+        """Get the leftmost non-empty text cell in a row as a potential row header."""
+        for col_idx in range(min(3, len(df.columns))):  # Check first 3 columns
+            value = df.iloc[row_idx, col_idx]
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+    
+    def _find_section_patterns(self, df: pd.DataFrame, keyword_dict: Dict) -> List[Tuple[int, int, str]]:
+        """Find sections in the spreadsheet based on keyword patterns."""
+        sections = []
+        
+        for category, keywords in keyword_dict.items():
+            for row_idx in range(len(df)):
+                for col_idx in range(len(df.columns)):
+                    value = df.iloc[row_idx, col_idx]
+                    if isinstance(value, str):
+                        value_lower = value.lower()
+                        if any(keyword in value_lower for keyword in keywords):
+                            # Found a section header, determine its range
+                            section_end = min(row_idx + 10, len(df))  # Look ahead 10 rows
+                            sections.append((row_idx, section_end, category))
+                            break
+        
+        return sections
+    
+    def _identify_header_rows(self, df: pd.DataFrame) -> List[int]:
+        """Identify rows that likely contain headers or section titles."""
+        header_rows = []
+        
+        for row_idx in range(min(5, len(df))):  # Check first 5 rows
+            row_data = df.iloc[row_idx].dropna()
+            if not row_data.empty:
+                text_ratio = sum(isinstance(val, str) for val in row_data) / len(row_data)
+                if text_ratio > 0.7:  # Mostly text
+                    header_rows.append(row_idx)
+        
+        return header_rows
+    
+    def _categorize_field(self, field_lower: str) -> str:
+        """Categorize a field based on its name."""
+        for category, keywords in {**self.personnel_keywords, **self.expense_categories}.items():
+            if any(keyword in field_lower for keyword in keywords):
+                return category
+        return 'general'
+    
+    def _calculate_keyword_match_score(self, field_lower: str, context: CellContext, 
+                                     field_category: str) -> float:
+        """Calculate a match score based on keyword similarity."""
         score = 0.0
         
-        field_name = field.original_text.lower()
-        cell_text = str(cell.value).lower()
+        # Check the cell value
+        if isinstance(context.value, str):
+            value_lower = context.value.lower()
+            score += fuzz.partial_ratio(field_lower, value_lower) / 100.0 * 0.6
         
-        # Exact match gets high score
-        if field_name == cell_text:
-            score += 0.9
+        # Check nearby text
+        for text in context.nearby_text:
+            text_lower = text.lower()
+            score += fuzz.partial_ratio(field_lower, text_lower) / 100.0 * 0.2
         
-        # Fuzzy string matching
-        similarity = difflib.SequenceMatcher(None, field_name, cell_text).ratio()
-        score += similarity * 0.6
+        # Check column header
+        if context.column_header and isinstance(context.column_header, str):
+            header_lower = context.column_header.lower()
+            score += fuzz.partial_ratio(field_lower, header_lower) / 100.0 * 0.3
         
-        # Check semantic patterns
-        patterns = self.semantic_patterns.get(field.field_type, {})
-        
-        for pattern_type, pattern_list in patterns.items():
-            for pattern in pattern_list:
-                if pattern in cell_text:
-                    if pattern_type == 'exact':
-                        score += 0.4
-                    elif pattern_type == 'partial':
-                        score += 0.3
-                    elif pattern_type == 'indicators':
-                        score += 0.2
-        
-        # Data type compatibility
-        if self._check_data_type_compatibility(field.field_type, cell.data_type):
-            score += 0.2
-        
-        return min(score, 1.0)
-    
-    def _calculate_context_score(self, field: DetectedField, cell: CellData) -> float:
-        """Calculate context-based score"""
-        score = 0.0
-        
-        field_name = field.original_text.lower()
-        context_text = ' '.join(cell.context_labels).lower()
-        column_text = cell.column_name.lower()
-        
-        # Check if field name appears in context
-        if field_name in context_text:
-            score += 0.5
-        if field_name in column_text:
-            score += 0.4
-        
-        # Check for related terms in context
-        patterns = self.semantic_patterns.get(field.field_type, {})
-        for pattern_list in patterns.values():
-            for pattern in pattern_list:
-                if pattern in context_text:
+        # Bonus for category match
+        if field_category != 'general':
+            category_keywords = {**self.personnel_keywords, **self.expense_categories}.get(field_category, [])
+            for keyword in category_keywords:
+                if isinstance(context.value, str) and keyword in context.value.lower():
                     score += 0.2
-                if pattern in column_text:
-                    score += 0.3
-        
-        # Grant-specific context boost
-        if field.grant_specific:
-            grant_terms = ['grant', 'proposal', 'budget', 'personnel', 'investigator']
-            for term in grant_terms:
-                if term in context_text:
+                if any(keyword in text.lower() for text in context.nearby_text):
                     score += 0.1
         
-        # Cell confidence boost
-        score += cell.confidence * 0.3
-        
         return min(score, 1.0)
     
-    def _calculate_proximity_score(self, field: DetectedField, cell: CellData) -> float:
-        """Calculate proximity-based score (heuristic)"""
-        # Since we don't have field positions in the budget, use contextual proximity
+    def _looks_like_person_name(self, text: str) -> bool:
+        """Check if text looks like a person's name."""
+        if not isinstance(text, str) or len(text.strip()) < 3:
+            return False
+        
+        # Simple heuristics for person names
+        words = text.strip().split()
+        if len(words) < 2:
+            return False
+        
+        # Check for common name patterns
+        has_capital = any(word[0].isupper() for word in words if word)
+        has_reasonable_length = all(2 <= len(word) <= 20 for word in words if word)
+        no_numbers = not any(char.isdigit() for char in text)
+        
+        return has_capital and has_reasonable_length and no_numbers
+    
+    def _calculate_proximity_score(self, field_lower: str, context: CellContext, 
+                                  df: pd.DataFrame) -> float:
+        """Calculate proximity score based on nearby labels."""
         score = 0.0
         
-        # If cell has good context labels, boost proximity score
-        if cell.context_labels:
-            score += 0.3
+        # Check cell to the left
+        if context.col > 0:
+            left_cell = df.iloc[context.row, context.col - 1]
+            if isinstance(left_cell, str):
+                score += fuzz.partial_ratio(field_lower, left_cell.lower()) / 100.0 * 0.4
         
-        # If cell is in a structured group (like personnel or expense sections)
-        if hasattr(self.budget_book, 'sheets_data'):
-            for sheet_data in self.budget_book.sheets_data.values():
-                # Check if cell is in personnel entries
-                if any(entry['cell'] == cell for entry in sheet_data.get('personnel_entries', [])):
-                    if field.field_type.value.startswith('personnel'):
-                        score += 0.4
-                
-                # Check if cell is in expense entries
-                if any(entry['cell'] == cell for entry in sheet_data.get('expense_categories', [])):
-                    if field.field_type.value.startswith('expense'):
-                        score += 0.4
-                
-                # Check if cell is in notes column
-                if (sheet_data.get('notes_column') == cell.col and 
-                    field.field_type in [FieldType.NOTES, FieldType.DESCRIPTION, FieldType.JUSTIFICATION]):
-                    score += 0.5
+        # Check cell above
+        if context.row > 0:
+            above_cell = df.iloc[context.row - 1, context.col]
+            if isinstance(above_cell, str):
+                score += fuzz.partial_ratio(field_lower, above_cell.lower()) / 100.0 * 0.3
         
-        # Proximity based on data type appropriateness
-        if self._check_data_type_compatibility(field.field_type, cell.data_type):
-            score += 0.2
+        # Check column header
+        if context.column_header and isinstance(context.column_header, str):
+            score += fuzz.partial_ratio(field_lower, context.column_header.lower()) / 100.0 * 0.3
         
         return min(score, 1.0)
     
-    def _check_data_type_compatibility(self, field_type: FieldType, cell_data_type: str) -> bool:
-        """Check if field type is compatible with cell data type"""
-        numeric_fields = {
-            FieldType.PERSONNEL_SALARY, FieldType.PERSONNEL_EFFORT, 
-            FieldType.EXPENSE_AMOUNT, FieldType.QUANTITY, FieldType.RATE, 
-            FieldType.TOTAL, FieldType.YEAR
-        }
+    def _prepare_llm_context(self, field: str, contexts: List[CellContext], 
+                           df: pd.DataFrame) -> str:
+        """Prepare context information for LLM analysis."""
+        context_lines = []
+        context_lines.append(f"Looking for field: {field}")
+        context_lines.append(f"Spreadsheet size: {len(df)} rows x {len(df.columns)} columns")
+        context_lines.append("\nSample cells with context:")
         
-        text_fields = {
-            FieldType.PERSONNEL_NAME, FieldType.PERSONNEL_TITLE,
-            FieldType.EXPENSE_ITEM, FieldType.EXPENSE_CATEGORY,
-            FieldType.DESCRIPTION, FieldType.NOTES, FieldType.JUSTIFICATION
-        }
+        for i, ctx in enumerate(contexts[:20]):  # Limit sample size
+            context_lines.append(f"Row {ctx.row}, Col {ctx.col}: '{ctx.value}'")
+            if ctx.column_header:
+                context_lines.append(f"  Column header: '{ctx.column_header}'")
+            if ctx.nearby_text:
+                context_lines.append(f"  Nearby: {ctx.nearby_text[:3]}")
         
-        if field_type in numeric_fields:
-            return cell_data_type in ['numeric', 'mixed']
-        elif field_type in text_fields:
-            return cell_data_type in ['text', 'mixed']
-        else:
-            return True  # Unknown field types accept any data type
+        return "\n".join(context_lines)
     
-    def _determine_match_reasons(self, field: DetectedField, cell: CellData,
-                               semantic_score: float, context_score: float,
-                               proximity_score: float) -> List[str]:
-        """Determine reasons why this cell matches the field"""
-        reasons = []
+    def _parse_llm_response(self, response: str, field: str, 
+                           contexts: List[CellContext]) -> List[FieldMatch]:
+        """Parse LLM response and create field matches."""
+        matches = []
         
-        if semantic_score > 0.7:
-            reasons.append("Strong semantic similarity")
-        elif semantic_score > 0.4:
-            reasons.append("Moderate semantic similarity")
+        # Simple parsing - look for row/column coordinates and confidence
+        lines = response.split('\n')
+        for line in lines:
+            if 'row' in line.lower() and 'col' in line.lower():
+                # Extract coordinates and confidence
+                try:
+                    # This would need more sophisticated parsing based on actual LLM response format
+                    row_match = re.search(r'row\s*(\d+)', line.lower())
+                    col_match = re.search(r'col\s*(\d+)', line.lower())
+                    conf_match = re.search(r'confidence[:\s]*([\d.]+)', line.lower())
+                    
+                    if row_match and col_match:
+                        row_idx = int(row_match.group(1))
+                        col_idx = int(col_match.group(1))
+                        confidence = float(conf_match.group(1)) if conf_match else 0.7
+                        
+                        # Find the corresponding context
+                        for ctx in contexts:
+                            if ctx.row == row_idx and ctx.col == col_idx:
+                                matches.append(FieldMatch(
+                                    field_name=field,
+                                    cell_address=f"R{row_idx}C{col_idx}",
+                                    value=ctx.value,
+                                    context=ctx,
+                                    match_type='llm',
+                                    confidence=confidence,
+                                    notes="LLM-powered match"
+                                ))
+                                break
+                except (ValueError, AttributeError):
+                    continue
         
-        if context_score > 0.6:
-            reasons.append("Found in relevant context")
-        
-        if proximity_score > 0.5:
-            reasons.append("Appropriate location/structure")
-        
-        # Specific reasons
-        field_name = field.original_text.lower()
-        cell_text = str(cell.value).lower()
-        context_text = ' '.join(cell.context_labels).lower()
-        
-        if field_name in cell_text:
-            reasons.append("Field name found in cell value")
-        
-        if field_name in context_text:
-            reasons.append("Field name found in context")
-        
-        if field_name in cell.column_name.lower():
-            reasons.append("Field name found in column header")
-        
-        if self._check_data_type_compatibility(field.field_type, cell.data_type):
-            reasons.append("Compatible data type")
-        
-        if cell.confidence > 0.8:
-            reasons.append("High-confidence cell")
-        
-        return reasons
+        return matches
     
-    def _generate_resolution_suggestions(self, field: DetectedField, 
-                                       scored_matches: List[CellMatch]) -> List[str]:
-        """Generate suggestions for field resolution"""
-        suggestions = []
+    def _rank_candidates(self, candidates: List[FieldMatch], field: str) -> List[FieldMatch]:
+        """Rank and filter candidates based on confidence and other factors."""
+        if not candidates:
+            return []
         
-        if not scored_matches:
-            suggestions.append("No potential matches found - check template field name")
-            suggestions.append("Consider manual mapping or field name adjustment")
-            return suggestions
-        
-        best_match = scored_matches[0]
-        
-        if best_match.final_score < 0.4:
-            suggestions.append("Low confidence match - manual review recommended")
-        
-        if best_match.final_score < 0.8 and len(scored_matches) > 1:
-            suggestions.append("Multiple similar matches found - review alternatives")
-        
-        # Type-specific suggestions
-        if field.field_type == FieldType.PERSONNEL_NAME:
-            if not any("name" in reason.lower() for reason in best_match.match_reasons):
-                suggestions.append("Consider checking cells with people's names")
-        
-        elif field.field_type == FieldType.EXPENSE_AMOUNT:
-            if best_match.cell.data_type != 'numeric':
-                suggestions.append("Consider checking numeric cells with dollar amounts")
-        
-        elif field.field_type in [FieldType.NOTES, FieldType.DESCRIPTION]:
-            suggestions.append("Check rightmost columns for notes/descriptions")
-        
-        # Add context-specific suggestions
-        if field.grant_specific:
-            suggestions.append("Look for grant-specific terminology in context")
-        
-        return suggestions[:4]  # Limit to top 4 suggestions
-    
-    def get_resolution_summary(self, resolution_results: List[ResolutionResult]) -> Dict[str, Any]:
-        """Generate summary of resolution results"""
-        total_fields = len(resolution_results)
-        resolved_fields = len([r for r in resolution_results if r.primary_match])
-        high_confidence = len([r for r in resolution_results if r.resolution_confidence > 0.8])
-        needs_review = len([r for r in resolution_results if r.needs_manual_review])
-        
-        # Field type breakdown
-        field_type_breakdown = defaultdict(int)
-        for result in resolution_results:
-            field_type_breakdown[result.field.field_type.value] += 1
-        
-        # Average confidence
-        avg_confidence = (
-            sum(r.resolution_confidence for r in resolution_results) / total_fields
-            if total_fields > 0 else 0
-        )
-        
-        return {
-            'total_fields': total_fields,
-            'resolved_fields': resolved_fields,
-            'high_confidence_resolutions': high_confidence,
-            'needs_manual_review': needs_review,
-            'average_confidence': avg_confidence,
-            'field_type_breakdown': dict(field_type_breakdown),
-            'resolution_rate': resolved_fields / total_fields if total_fields > 0 else 0
-        }
-    
-    def export_mapping_report(self, resolution_results: List[ResolutionResult]) -> str:
-        """Export detailed mapping report"""
-        report = []
-        report.append("=== FIELD MAPPING REPORT ===\n")
-        
-        for i, result in enumerate(resolution_results, 1):
-            report.append(f"{i}. Field: {result.field.placeholder}")
-            report.append(f"   Type: {result.field.field_type.value}")
-            report.append(f"   Confidence: {result.resolution_confidence:.2f}")
-            
-            if result.primary_match:
-                cell = result.primary_match.cell
-                report.append(f"   Matched to: {cell.value} (Row {cell.row}, Col {cell.col})")
-                report.append(f"   Reasons: {', '.join(result.primary_match.match_reasons)}")
+        # Remove duplicates (same cell address)
+        unique_candidates = {}
+        for candidate in candidates:
+            if candidate.cell_address not in unique_candidates:
+                unique_candidates[candidate.cell_address] = candidate
             else:
-                report.append("   No match found")
-            
-            if result.needs_manual_review:
-                report.append("   ⚠️  Manual review recommended")
-            
-            if result.suggestions:
-                report.append(f"   Suggestions: {'; '.join(result.suggestions)}")
-            
-            report.append("")
+                # Keep the one with higher confidence
+                if candidate.confidence > unique_candidates[candidate.cell_address].confidence:
+                    unique_candidates[candidate.cell_address] = candidate
         
-        return "\n".join(report)
+        # Sort by confidence
+        ranked = sorted(unique_candidates.values(), key=lambda x: x.confidence, reverse=True)
+        
+        # Filter by minimum confidence threshold
+        return [match for match in ranked if match.confidence > 0.3]
     
-    def suggest_template_improvements(self, resolution_results: List[ResolutionResult]) -> List[str]:
-        """Suggest improvements to template field names"""
-        suggestions = []
+    def _resolve_match_conflicts(self, matches: List[FieldMatch]) -> List[FieldMatch]:
+        """Resolve conflicts when multiple fields map to the same cell."""
+        cell_to_matches = {}
         
-        low_confidence_fields = [r for r in resolution_results if r.resolution_confidence < 0.5]
+        # Group matches by cell address
+        for match in matches:
+            if match.cell_address not in cell_to_matches:
+                cell_to_matches[match.cell_address] = []
+            cell_to_matches[match.cell_address].append(match)
         
-        for result in low_confidence_fields:
-            field_name = result.field.original_text
+        resolved_matches = []
+        
+        for cell_address, cell_matches in cell_to_matches.items():
+            if len(cell_matches) == 1:
+                resolved_matches.append(cell_matches[0])
+            else:
+                # Multiple fields want the same cell - pick the highest confidence
+                best_match = max(cell_matches, key=lambda x: x.confidence)
+                best_match.notes += f" (resolved conflict with {len(cell_matches)-1} other fields)"
+                resolved_matches.append(best_match)
+        
+        return resolved_matches
+
+    def analyze_text_content(self, text: str) -> Dict[str, Any]:
+        """Enhanced text analysis to determine content type and characteristics."""
+        if not isinstance(text, str) or not text.strip():
+            return {'type': 'empty', 'confidence': 0.0, 'features': {}}
+        
+        text = text.strip()
+        analysis = {'type': 'text', 'confidence': 0.5, 'features': {}}
+        
+        # Check if it's a person name
+        if self._is_person_name(text):
+            analysis.update({'type': 'person_name', 'confidence': 0.85, 'features': {'name_patterns': True}})
+        
+        # Check if it's a job title
+        elif self._is_job_title(text):
+            analysis.update({'type': 'job_title', 'confidence': 0.80, 'features': {'title_patterns': True}})
+        
+        # Check if it's a long description (likely notes)
+        elif len(text) > 50:
+            analysis.update({'type': 'description', 'confidence': 0.75, 'features': {'long_text': True, 'length': len(text)}})
+        
+        # Check for grant terminology
+        grant_terms = self._find_grant_terminology(text)
+        if grant_terms:
+            analysis['features']['grant_terms'] = grant_terms
+            analysis['confidence'] += 0.1
+        
+        return analysis
+    
+    def _is_person_name(self, text: str) -> bool:
+        """Enhanced person name detection using multiple patterns."""
+        if not isinstance(text, str) or len(text.strip()) < 3:
+            return False
+        
+        # Check against name patterns
+        for pattern in self.name_patterns:
+            if re.search(pattern, text):
+                return True
+        
+        # Additional heuristics
+        words = text.strip().split()
+        if len(words) < 2 or len(words) > 4:
+            return False
+        
+        # Names typically start with capital letters
+        if not all(word[0].isupper() for word in words if word):
+            return False
+        
+        # Names shouldn't contain numbers
+        if any(char.isdigit() for char in text):
+            return False
+        
+        return True
+    
+    def _is_job_title(self, text: str) -> bool:
+        """Enhanced job title detection using grant-specific patterns."""
+        if not isinstance(text, str) or len(text.strip()) < 3:
+            return False
+        
+        text_lower = text.lower().strip()
+        
+        # Check against title patterns
+        for pattern in self.title_patterns:
+            if re.search(pattern, text_lower):
+                return True
+        
+        # Check for general job title indicators
+        title_words = ['director', 'manager', 'coordinator', 'administrator', 'supervisor']
+        return any(word in text_lower for word in title_words)
+    
+    def _find_grant_terminology(self, text: str) -> List[str]:
+        """Find grant-specific terminology in text."""
+        text_lower = text.lower()
+        matches = []
+        
+        # Check all category keywords
+        for category, keywords in {**self.personnel_keywords, **self.expense_categories}.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    matches.append(keyword)
+        
+        return matches
+    
+    def find_notes_columns(self, df: pd.DataFrame) -> List[Tuple[int, str, float]]:
+        """Find columns that likely contain notes or descriptions."""
+        potential_notes = []
+        
+        # Check column headers
+        for col_idx, col_name in enumerate(df.columns):
+            if isinstance(col_name, str):
+                header_lower = col_name.lower().strip()
+                for pattern in self.note_column_patterns:
+                    if pattern in header_lower:
+                        potential_notes.append((col_idx, col_name, 0.9))
+                        break
+        
+        # Check rightmost columns with mostly text
+        if len(df.columns) > 3:  # Only if there are enough columns
+            rightmost_cols = list(range(len(df.columns) - 3, len(df.columns)))
             
-            if result.primary_match:
-                cell_value = result.primary_match.cell.value
-                context_labels = result.primary_match.cell.context_labels
+            for col_idx in rightmost_cols:
+                if col_idx < len(df.columns):
+                    col_data = df.iloc[:, col_idx].dropna()
+                    if len(col_data) > 0:
+                        text_ratio = sum(isinstance(val, str) and len(str(val)) > 20 
+                                       for val in col_data) / len(col_data)
+                        
+                        if text_ratio > 0.6:  # Mostly long text
+                            col_name = df.columns[col_idx] if col_idx < len(df.columns) else f"Column_{col_idx}"
+                            # Check if not already found
+                            if not any(idx == col_idx for idx, _, _ in potential_notes):
+                                potential_notes.append((col_idx, str(col_name), text_ratio * 0.7))
+        
+        return potential_notes
+    
+    def extract_personnel_from_context(self, contexts: List[CellContext]) -> List[Dict[str, Any]]:
+        """Extract personnel information from cell contexts."""
+        personnel_entries = []
+        
+        # Group contexts by row to find related information
+        row_groups = {}
+        for context in contexts:
+            if context.row not in row_groups:
+                row_groups[context.row] = []
+            row_groups[context.row].append(context)
+        
+        for row_idx, row_contexts in row_groups.items():
+            # Look for names in this row
+            names = []
+            titles = []
+            costs = []
+            notes = []
+            
+            for context in row_contexts:
+                if context.context_type == 'text' and isinstance(context.value, str):
+                    text_analysis = self.analyze_text_content(context.value)
+                    
+                    if text_analysis['type'] == 'person_name':
+                        names.append({
+                            'value': context.value,
+                            'location': f"R{context.row}C{context.col}",
+                            'confidence': text_analysis['confidence']
+                        })
+                    elif text_analysis['type'] == 'job_title':
+                        titles.append({
+                            'value': context.value,
+                            'location': f"R{context.row}C{context.col}",
+                            'confidence': text_analysis['confidence']
+                        })
+                    elif text_analysis['type'] == 'description':
+                        notes.append({
+                            'value': context.value,
+                            'location': f"R{context.row}C{context.col}",
+                            'confidence': text_analysis['confidence']
+                        })
                 
-                # Suggest better field names based on actual cell content
-                if context_labels:
-                    best_label = max(context_labels, key=len)  # Use longest context label
-                    suggestions.append(f"Consider renaming '{field_name}' to '{best_label}'")
-            else:
-                suggestions.append(f"Field '{field_name}' could not be matched - consider more specific naming")
+                elif context.context_type in ['numeric', 'currency']:
+                    costs.append({
+                        'value': context.value,
+                        'location': f"R{context.row}C{context.col}",
+                        'type': context.context_type
+                    })
+            
+            # Create personnel entries for rows with names
+            for name_info in names:
+                entry = {
+                    'name': name_info['value'],
+                    'name_location': name_info['location'],
+                    'name_confidence': name_info['confidence'],
+                    'row': row_idx
+                }
+                
+                # Add associated title if found
+                if titles:
+                    best_title = max(titles, key=lambda x: x['confidence'])
+                    entry['title'] = best_title['value']
+                    entry['title_location'] = best_title['location']
+                
+                # Add associated costs if found
+                if costs:
+                    entry['associated_costs'] = costs
+                
+                # Add notes if found
+                if notes:
+                    entry['notes'] = '; '.join(note['value'] for note in notes)
+                
+                personnel_entries.append(entry)
         
-        return suggestions
+        return personnel_entries

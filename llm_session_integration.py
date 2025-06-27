@@ -8,6 +8,9 @@ import logging
 from typing import Dict, Optional, Any, List
 from pathlib import Path
 
+import datetime
+import json
+
 # These would be added to the existing session_state.py imports
 from llm_client import LLMClient, FieldSuggestion
 from enhanced_field_detector import EnhancedFieldDetector, EnhancedMatch

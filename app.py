@@ -11,6 +11,8 @@ import logging
 from pathlib import Path
 import traceback
 
+from PyQt6.QtGui import QIcon
+
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
 
